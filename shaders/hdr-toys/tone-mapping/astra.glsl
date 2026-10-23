@@ -190,7 +190,6 @@
 //!VAR uint metered_median_i
 //!VAR uint metered_diffuse_white_i
 //!VAR uint metered_histogram[1024]
-//!VAR uint metered_coarse_histogram[64]
 //!VAR float metered_zone_average[144]
 //!VAR float metered_zone_spread[144]
 //!VAR float metered_zone_preview_weight[144]
@@ -200,22 +199,29 @@
 //!VAR uint metered_zones_valid
 //!STORAGE
 
-//!BUFFER METERED_TEMPORAL
-//!VAR float metered_reference_histogram[64]
-//!VAR float metered_previous_histogram[64]
-//!VAR uint metered_temporal_valid
-//!VAR uint metered_temporal_pts
-//!VAR uint metered_scene_adaptation_end_pts
-//!VAR uint metered_scene_fast_response
-//!VAR uint metered_scene_cut_detected
-//!VAR float metered_scene_speed
-//!VAR float metered_reference_zones[144]
-//!VAR uint metered_reference_zones_valid
-//!VAR float metered_response_evidence
-//!VAR float metered_response_direction
-//!VAR float metered_response_confidence
-//!VAR uint metered_response_candidate_active
-//!VAR uint metered_response_candidate_start_pts
+//!BUFFER SCENE_DSM
+//!VAR float dsm_weights[64]
+//!VAR float dsm_age[64]
+//!VAR float dsm_precision[256]
+//!VAR float dsm_information[256]
+//!VAR uint dsm_bank
+//!VAR uint dsm_count
+//!VAR uint dsm_valid
+//!VAR uint dsm_last_pts
+//!VAR float dsm_accepted_age
+//!STORAGE
+
+//!BUFFER SCENE_RESPONSE
+//!VAR float scene_new_probability
+//!VAR float scene_short_probability
+//!VAR float scene_confirmed_probability
+//!VAR float scene_fast_strength
+//!VAR float scene_discarded_mass
+//!VAR uint scene_hard_cut
+//!VAR uint scene_bootstrap
+//!VAR uint scene_observation_pts
+//!VAR uint scene_observation_valid
+//!VAR uint scene_state_recovered
 //!STORAGE
 
 //!BUFFER EXPOSURE_TEMPORAL
@@ -261,7 +267,6 @@
 
 //!BUFFER PREVIEW_HISTOGRAM
 //!VAR float preview_histogram_current[64]
-//!VAR float preview_histogram_reference[64]
 //!VAR float preview_histogram_curve[256]
 //!STORAGE
 
@@ -269,11 +274,11 @@
 //!BIND HOOKED
 //!SAVE METERING
 //!COMPONENTS 2
-//!WHEN enable_metering 0 > max_pq_y 0 > ! scene_max_r 0 > scene_max_g 0 > + scene_max_b 0 > + ! * force_metering + * preview_metering +
+//!WHEN enable_metering 0 > max_pq_y 0 > ! scene_max_r 0 > scene_max_g 0 > + scene_max_b 0 > + ! * force_metering + * preview_metering + temporal_stable_duration 0 > enable_metering 0 > * +
 //!DESC metering (intensity map)
 
 // Keep the peak-metadata test aligned with resolve_metering_metrics().
-// Preview also runs metering, but does not force the resolver to use it.
+// Preview and DSM also run metering without changing exposure's data source.
 // BIND METERING gates consumers on the availability of the current map.
 // WHEN is evaluated before BIND; do not query a conditionally absent texture.
 // Keep the shader directive marker (two slashes followed by an exclamation
@@ -708,11 +713,13 @@ void hook() {
 //!WIDTH 256
 //!HEIGHT 144
 //!COMPUTE 16 16 16 16
-//!WHEN auto_exposure_anchor 0 > preview_metering + enable_metering 1 > *
+//!WHEN auto_exposure_anchor 0 > preview_metering + enable_metering 1 > * temporal_stable_duration 0 > enable_metering 0 > * +
 //!DESC metering (matrix zones)
 
 // METERING must exist. Run zones at metering level 2 when automatic
 // exposure has a positive anchor or the preview is enabled.
+// DSM also requests zones at either enabled metering level, independently
+// of the exposure anchor and the presence of dynamic HDR metadata.
 
 // A 256x144 analysis grid maps exactly to 16x9 workgroups. Each workgroup
 // builds a compact histogram for one image zone, then publishes a robust mean
@@ -938,8 +945,6 @@ const float METERING_CODE_SCALE = 4095.0;
 const uint METERING_HISTOGRAM_SIZE = 1024u;
 const uint METERING_REDUCTION_SIZE = 256u;
 const uint METERING_BINS_PER_THREAD = 4u;
-const uint METERING_COARSE_HISTOGRAM_SIZE = 64u;
-const uint METERING_BLOCKS_PER_COARSE_BIN = 4u;
 const uint METERING_SAMPLE_COUNT = 512u * 288u;
 
 // The percentile family: BLACK and WHITE locate the extrema histogram
@@ -1384,20 +1389,6 @@ uint find_percentile_bin(
     return first + METERING_BINS_PER_THREAD - 1u;
 }
 
-void publish_coarse_histogram(uint tid) {
-    if (tid >= METERING_COARSE_HISTOGRAM_SIZE) {
-        return;
-    }
-
-    uint last_block = (tid + 1u) * METERING_BLOCKS_PER_COARSE_BIN - 1u;
-    uint first_block = tid * METERING_BLOCKS_PER_COARSE_BIN;
-    uint cumulative_before = first_block == 0u
-        ? 0u
-        : histogram_scan[0][first_block - 1u];
-    metered_coarse_histogram[tid] =
-        histogram_scan[0][last_block] - cumulative_before;
-}
-
 // A percentile of the declared sample count, floored at one sample so a
 // percentile that rounds to zero still selects a bin instead of none.
 uint percentile_target(uint sample_count, float percentile) {
@@ -1471,7 +1462,6 @@ void reduce_histogram_statistics(
     }
 
     scan_histogram_blocks(tid, sum_histogram_block(counts));
-    publish_coarse_histogram(tid);
     locate_percentiles(tid, first, counts);
 
     uint global_total = histogram_scan[0][METERING_REDUCTION_SIZE - 1u];
@@ -1536,468 +1526,304 @@ void reduce_metering_statistics() {
 void hook() { reduce_metering_statistics(); }
 
 //!HOOK OUTPUT
-//!BIND METERING
 //!BIND METERED
-//!BIND METERED_TEMPORAL
+//!BIND SCENE_DSM
+//!BIND SCENE_RESPONSE
 //!SAVE EMPTY
 //!WIDTH 64
 //!HEIGHT 1
 //!COMPUTE 64 1 64 1
-//!WHEN temporal_stable_duration 0.0 >
-//!DESC metering (temporal stabilization)
+//!DESC metering (scene adaptation)
 
-// METERED_TEMPORAL lifecycle:
-// Written by temporal metering; read by metadata only when its PTS matches
-// the current, selected measurements. A detected cut remains latched across
-// redraws of that PTS and is cleared on the next processed observation.
-// Exposure and curve consumers check their own PTS before acting on the cut,
-// so each history resets only once. Fast response instead lasts until its
-// adaptation deadline; zone confidence describes sustained spatial change.
+// Before-observation changepoints, diagonal known-variance Gaussian DSM.
+// https://proceedings.mlr.press/v202/altamirano23a.html
+const uint DSM_CAPACITY = 32u;
+const float DSM_SIGMA_SQUARED = 0.0625;
+const float DSM_PRIOR_PRECISION = 1.0 / 9.0;
+const float DSM_OUTLIER_VARIANCE = 64.0;
+const float DSM_CONTAMINATION = 0.02;
+const float DSM_SHOT_SECONDS = 5.0;
+const float DSM_SHORT_SECONDS = 0.15;
+const float DSM_MAX_GAP = 1.0;
+const float DSM_PTS_EPSILON = 1e-6;
+const float DSM_CUT_PROBABILITY = 0.95;
 
-// One just-noticeable difference step on the PQ scale.
-const float JND = 1.0 / 720.0;
+shared vec4 dsm_z;
+shared vec4 dsm_mask;
+shared vec4 dsm_precision_step;
+shared vec4 dsm_information_step;
+shared float dsm_logits[33];
+shared float dsm_ages[33];
+shared uint dsm_selected[32];
+shared uint dsm_operation;
+shared uint dsm_old_count;
+shared uint dsm_next_count;
+shared uint dsm_read_bank;
+shared uint dsm_bad_history;
+shared float dsm_dt;
+shared float dsm_log_hazard;
+shared float dsm_log_kept;
 
-// Scene analysis uses one-dimensional Wasserstein distance on the 64-bin PQ
-// distributions. The current frame is compared both with a slowly moving shot
-// reference and with the immediately previous frame: only an abrupt transition
-// resets the output histories immediately. The previous speed predicts change over
-// the elapsed PTS interval, so sustained ramps do not become cuts merely
-// because their per-observation distance grows with the sampling interval.
-
-const uint TEMPORAL_HISTOGRAM_SIZE = 64u;
-const uint TEMPORAL_HISTOGRAM_SAMPLE_COUNT = 512u * 288u;
-const float TEMPORAL_HISTOGRAM_CUT_THRESHOLD = 144 * JND;
-const float TEMPORAL_HISTOGRAM_FRAME_THRESHOLD = 72 * JND;
-const float TEMPORAL_HISTOGRAM_TIME_SCALE = 0.50;
-const float TEMPORAL_SCENE_SPEED_TIME_SCALE = 0.50;
-const float TEMPORAL_SCENE_ADAPTATION_TIME_SCALE = 0.50;
-// Minimum temporal time constant in seconds (approximately 4.17 ms),
-// shared by the reference blend and scene response intervals.
-const float TEMPORAL_MIN_TIME_CONSTANT = 1.0 / 240.0;
-const float TEMPORAL_PTS_EPSILON = 1e-6;
-
-const uint TEMPORAL_ZONE_COUNT = 144u;
-const float TEMPORAL_ZONE_DIFFERENCE_LOW = 4 * JND;
-const float TEMPORAL_ZONE_DIFFERENCE_HIGH = 32 * JND;
-const float TEMPORAL_ZONE_SUPPORT_LOW = 0.25;
-const float TEMPORAL_ZONE_SUPPORT_HIGH = 0.75;
-const float TEMPORAL_EVIDENCE_TIME_SCALE = 0.25;
-const float TEMPORAL_DIRECTION_DEADBAND = 0.05;
-const float TEMPORAL_DIRECTION_CONFIRM_TIME_SCALE = 0.125;
-
-const uint TEMPORAL_FRAME_SKIP = 0u;
-const uint TEMPORAL_FRAME_INITIALIZE = 1u;
-const uint TEMPORAL_FRAME_PROCESS = 2u;
-const uint TEMPORAL_REFERENCE_KEEP = 0u;
-const uint TEMPORAL_REFERENCE_BLEND = 1u;
-const uint TEMPORAL_REFERENCE_REPLACE = 2u;
-
-shared vec2 temporal_scan[2][TEMPORAL_HISTOGRAM_SIZE];
-shared uint temporal_frame_operation;
-shared uint temporal_reference_operation;
-shared float temporal_delta_time;
-shared float temporal_reference_alpha;
-shared vec4 temporal_partial[TEMPORAL_HISTOGRAM_SIZE];
-shared bool temporal_zone_reversed;
-shared uint temporal_zones_available;
-
-float pts_to_float(uint x) {
-    return uintBitsToFloat(x);
+bool dsm_finite(float x) {
+    return !isnan(x) && !isinf(x);
 }
 
-uint pts_to_uint(float x) {
-    return floatBitsToUint(x);
+void dsm_clear_response() {
+    scene_new_probability = 0.0;
+    scene_short_probability = 0.0;
+    scene_confirmed_probability = 0.0;
+    scene_fast_strength = 0.0;
+    scene_discarded_mass = 0.0;
+    scene_hard_cut = 0u;
+    scene_bootstrap = 0u;
+    scene_observation_valid = 0u;
+    scene_state_recovered = 0u;
+    scene_observation_pts = floatBitsToUint(PTS);
 }
 
-bool finite_float(float value) {
-    return !isnan(value) && !isinf(value);
-}
+void dsm_prepare() {
+    dsm_operation = 0u;
+    dsm_bad_history = 0u;
+    if (temporal_stable_duration <= 0.0 ||
+        enable_metering == 0u || !dsm_finite(PTS)) {
+        dsm_valid = 0u;
+        dsm_clear_response();
+        return;
+    }
+    if (dsm_valid > 0u &&
+        abs(PTS - uintBitsToFloat(dsm_last_pts)) <= DSM_PTS_EPSILON) {
+        return;
+    }
+    dsm_clear_response();
 
-float temporal_alpha(float delta_time, float time_constant) {
-    return 1.0 - exp(
-        -delta_time / max(time_constant, TEMPORAL_MIN_TIME_CONSTANT)
-    );
-}
-
-float temporal_histogram_value(uint coarse_index) {
-    return float(metered_coarse_histogram[coarse_index]) /
-           float(TEMPORAL_HISTOGRAM_SAMPLE_COUNT);
-}
-
-void temporal_clear_zone_candidate() {
-    metered_response_candidate_active = 0u;
-    metered_response_candidate_start_pts = 0u;
-}
-
-void temporal_reset_zone_response() {
-    temporal_clear_zone_candidate();
-    metered_reference_zones_valid = 0u;
-    metered_response_evidence = 0.0;
-    metered_response_direction = 0.0;
-    metered_response_confidence = 0.0;
-}
-
-void temporal_set_scalar_state(uint histogram_valid) {
-    metered_temporal_valid = histogram_valid;
-    metered_scene_adaptation_end_pts = 0u;
-    metered_scene_fast_response = 0u;
-    metered_scene_cut_detected = 0u;
-    metered_scene_speed = 0.0;
-    temporal_reset_zone_response();
-}
-
-void temporal_initialize_frame() {
-    temporal_set_scalar_state(1u);
-    metered_temporal_pts = pts_to_uint(PTS);
-    temporal_frame_operation = TEMPORAL_FRAME_INITIALIZE;
-}
-
-vec2 temporal_measure_delta_and_update_previous(uint index, float current) {
-    vec2 delta = vec2(
-        current - metered_reference_histogram[index],
-        current - metered_previous_histogram[index]
-    );
-    metered_previous_histogram[index] = current;
-    return delta;
-}
-
-void temporal_scan_distribution_delta(uint tid, vec2 delta) {
-    temporal_scan[0][tid] = delta;
-    barrier();
-
-    // Ping-pong storage preserves the add order without a pre-write barrier.
-    // The fixed power-of-four size has an even number of rounds: bank 0 wins.
-    uint bank = 0u;
-    for (uint offset = 1u; offset < TEMPORAL_HISTOGRAM_SIZE; offset <<= 1u) {
-        vec2 inclusive = temporal_scan[bank][tid];
-        if (tid >= offset) {
-            inclusive += temporal_scan[bank][tid - offset];
+    // This pass runs even when disabled to invalidate dormant history. The
+    // intensity-map gate guarantees fresh measurements when DSM is enabled.
+    uint total = 0u;
+    for (uint i = 0u; i < 1024u; i++) {
+        total += metered_histogram[i];
+    }
+    if (total == 0u || !dsm_finite(metered_histogram_average) ||
+        metered_histogram_average < 0.0 || metered_histogram_average > 1.0) {
+        return;
+    }
+    uint cumulative = 0u;
+    uint p50 = 0u;
+    uint p80 = 0u;
+    uint target50 = uint(ceil(0.5 * float(total)));
+    uint target80 = uint(ceil(0.8 * float(total)));
+    for (uint i = 0u; i < 1024u; i++) {
+        uint before = cumulative;
+        cumulative += metered_histogram[i];
+        if (before < target50 && cumulative >= target50) {
+            p50 = i;
         }
-        temporal_scan[1u - bank][tid] = inclusive;
-        barrier();
-        bank = 1u - bank;
+        if (before < target80 && cumulative >= target80) {
+            p80 = i;
+        }
+    }
+    bool matrix_valid = metered_zones_valid > 0u &&
+                        metered_matrix_blend > 0.0 &&
+                        dsm_finite(metered_matrix_average) &&
+                        metered_matrix_average >= 0.0 && metered_matrix_average <= 1.0;
+    dsm_mask = vec4(1.0, 1.0, 1.0, matrix_valid ? 1.0 : 0.0);
+    dsm_z = (vec4(metered_histogram_average,
+                  (float(p50) + 0.5) / 1024.0,
+                  (float(p80) + 0.5) / 1024.0,
+                  matrix_valid ? metered_matrix_average : 0.5) - 0.5) * 10.0;
+    vec4 a = 1.0 / (1.0 + dsm_z * dsm_z / 9.0);
+    vec4 derivative = -2.0 * dsm_z * a * a / 9.0;
+    // omega=sigma²/2: prec += a/sigma², information += a*z/sigma²-a'.
+    dsm_precision_step = dsm_mask * a / DSM_SIGMA_SQUARED;
+    dsm_information_step = dsm_mask * (
+        a * dsm_z / DSM_SIGMA_SQUARED - derivative
+    );
+    dsm_dt = PTS - uintBitsToFloat(dsm_last_pts);
+    bool corrupt = dsm_valid > 0u && (dsm_count == 0u ||
+                   dsm_count > DSM_CAPACITY || dsm_bank > 1u ||
+                   !dsm_finite(dsm_dt) || !dsm_finite(dsm_accepted_age) ||
+                   dsm_accepted_age < 0.0);
+    bool reset = dsm_valid == 0u || corrupt || dsm_dt < 0.0 || dsm_dt > DSM_MAX_GAP;
+    scene_state_recovered = corrupt ? 1u : 0u;
+    dsm_operation = reset ? 1u : 2u;
+    dsm_old_count = reset ? 0u : dsm_count;
+    dsm_read_bank = reset ? 0u : dsm_bank;
+    if (!reset) {
+        float h = dsm_dt / DSM_SHOT_SECONDS;
+        float hazard = h < 0.001 ? h * (1.0 - h * 0.5 + h * h / 6.0)
+                                   : 1.0 - exp(-h);
+        dsm_log_hazard = log(max(hazard, 1e-12));
     }
 }
 
-vec2 temporal_cdf_distance(uint tid) {
-    // Both normalized CDFs end at total probability one, so their last
-    // inclusive difference is zero. Wasserstein-1 therefore integrates only
-    // the first 63 boundaries.
-    // Each uniform PQ bin spans 1/64 of the normalized code-value axis.
-    return tid + 1u < TEMPORAL_HISTOGRAM_SIZE
-        ? abs(temporal_scan[0][tid]) /
-          float(TEMPORAL_HISTOGRAM_SIZE)
-        : vec2(0.0);
+float dsm_predictive(vec4 prec, vec4 information) {
+    vec4 variance = DSM_SIGMA_SQUARED + 1.0 / prec;
+    vec4 residual = dsm_z - information / prec;
+    float normal = -0.5 * dot(dsm_mask,
+        log(6.283185307179586 * variance) + residual * residual / variance
+    ) + log(1.0 - DSM_CONTAMINATION);
+    float outlier = -0.5 * dot(dsm_mask,
+        vec4(log(6.283185307179586 * DSM_OUTLIER_VARIANCE)) +
+        dsm_z * dsm_z / DSM_OUTLIER_VARIANCE
+    ) + log(DSM_CONTAMINATION);
+    float largest = max(normal, outlier);
+    return largest + log(exp(normal - largest) + exp(outlier - largest));
 }
 
-void temporal_reduce_statistics(uint index, vec2 distance, vec2 support) {
-    // Independent reductions share synchronization, not their arithmetic:
-    // preserve each component's original 32,16,...,1 addition tree.
-    temporal_partial[index] = vec4(distance, support);
-    barrier();
-    for (uint size = TEMPORAL_HISTOGRAM_SIZE >> 1u;
-         size > 0u; size >>= 1u) {
-        if (index < size) {
-            temporal_partial[index] += temporal_partial[index + size];
-        }
-        barrier();
+void dsm_candidate(uint index) {
+    if (index > dsm_old_count) {
+        return;
     }
-}
-
-float temporal_reference_blend_alpha(float delta_time) {
-    float time_constant = temporal_stable_duration *
-                          TEMPORAL_HISTOGRAM_TIME_SCALE;
-    return temporal_alpha(delta_time, time_constant);
-}
-
-vec2 temporal_update_zone_references(uint index, bool initialize) {
-    float alpha = initialize ? 1.0 : temporal_reference_blend_alpha(
-        temporal_delta_time
-    );
-    vec2 support = vec2(0.0);
-    for (uint zone = index; zone < TEMPORAL_ZONE_COUNT;
-         zone += TEMPORAL_HISTOGRAM_SIZE) {
-        float current = metered_zone_average[zone];
-        float reference = initialize ? current : metered_reference_zones[zone];
-        reference = finite_float(reference) ? reference : current;
-        float delta = current - reference;
-        float weight = smoothstep(
-            TEMPORAL_ZONE_DIFFERENCE_LOW,
-            TEMPORAL_ZONE_DIFFERENCE_HIGH,
-            abs(delta)
+    if (index == dsm_old_count) {
+        dsm_logits[index] = dsm_log_hazard + dsm_predictive(
+            vec4(DSM_PRIOR_PRECISION), vec4(0.0)
         );
-        support += delta > 0.0 ? vec2(weight, 0.0) : vec2(0.0, weight);
-        metered_reference_zones[zone] = mix(reference, current, alpha);
+        dsm_ages[index] = 0.0;
+        return;
     }
-    return support;
+    uint slot = dsm_read_bank * DSM_CAPACITY + index;
+    vec4 prec;
+    vec4 information;
+    bool valid = dsm_finite(dsm_weights[slot]) &&
+                 dsm_finite(dsm_age[slot]) && dsm_age[slot] >= 0.0;
+    for (uint d = 0u; d < 4u; d++) {
+        prec[d] = dsm_precision[slot * 4u + d];
+        information[d] = dsm_information[slot * 4u + d];
+        valid = valid && dsm_finite(prec[d]) && prec[d] > 0.0 &&
+                dsm_finite(information[d]);
+    }
+    if (!valid) {
+        atomicOr(dsm_bad_history, 1u);
+        return;
+    }
+    dsm_logits[index] = dsm_weights[slot] - dsm_dt / DSM_SHOT_SECONDS +
+                        dsm_predictive(prec, information);
+    // Ages avoid subtracting two large absolute timestamps for short runs.
+    dsm_ages[index] = dsm_age[slot] + dsm_dt;
+    if (!dsm_finite(dsm_logits[index]) || !dsm_finite(dsm_ages[index])) {
+        atomicOr(dsm_bad_history, 1u);
+    }
 }
 
-void temporal_update_zone_evidence(bool initialize) {
-    vec2 support = temporal_partial[0].zw / float(TEMPORAL_ZONE_COUNT);
-    float balance = support.x - support.y;
-    float direction = abs(balance) > TEMPORAL_DIRECTION_DEADBAND
-        ? sign(balance) : 0.0;
-    float target = smoothstep(
-        TEMPORAL_ZONE_SUPPORT_LOW,
-        TEMPORAL_ZONE_SUPPORT_HIGH,
-        max(support.x, support.y)
-    );
-    float evidence = metered_response_evidence;
-    temporal_zone_reversed = false;
-    if (initialize || !finite_float(evidence)) {
-        evidence = 0.0;
-        metered_response_direction = 0.0;
-        temporal_clear_zone_candidate();
+void dsm_select() {
+    float largest = dsm_logits[0];
+    for (uint i = 1u; i <= dsm_old_count; i++) {
+        largest = max(largest, dsm_logits[i]);
     }
-
-    if (direction == 0.0) {
-        // Ambiguous support interrupts confirmation, but only decays evidence.
-        temporal_clear_zone_candidate();
-        target = 0.0;
-    } else if (metered_response_direction == 0.0 ||
-               direction == metered_response_direction) {
-        metered_response_direction = direction;
-        temporal_clear_zone_candidate();
-    } else {
-        // Do not turn a single opposite observation into a direction reset.
-        if (metered_response_candidate_active == 0u) {
-            metered_response_candidate_active = 1u;
-            metered_response_candidate_start_pts = pts_to_uint(PTS);
+    float total = 0.0;
+    for (uint i = 0u; i <= dsm_old_count; i++) {
+        total += exp(dsm_logits[i] - largest);
+    }
+    float log_total = largest + log(total);
+    float accepted_age = dsm_accepted_age + dsm_dt;
+    float short_mass = 0.0;
+    float confirmed_mass = 0.0;
+    for (uint i = 0u; i <= dsm_old_count; i++) {
+        float mass = exp(dsm_logits[i] - log_total);
+        if (dsm_ages[i] <= DSM_SHORT_SECONDS + DSM_PTS_EPSILON) {
+            short_mass += mass;
+            // Require a second observation and exclude every hypothesis
+            // already present when the last event (or bootstrap) was accepted.
+            if (dsm_ages[i] > DSM_PTS_EPSILON &&
+                dsm_ages[i] < accepted_age - DSM_PTS_EPSILON) {
+                confirmed_mass += mass;
+            }
         }
-        float elapsed = PTS - pts_to_float(metered_response_candidate_start_pts);
-        float confirmation_time = max(
-            temporal_stable_duration * TEMPORAL_DIRECTION_CONFIRM_TIME_SCALE,
-            TEMPORAL_MIN_TIME_CONSTANT
-        );
-        if (elapsed >= confirmation_time) {
-            evidence = 0.0;
-            metered_response_direction = direction;
-            temporal_zone_reversed = true;
-            temporal_clear_zone_candidate();
+    }
+    scene_new_probability = clamp(exp(dsm_logits[dsm_old_count] - log_total), 0.0, 1.0);
+    scene_short_probability = clamp(short_mass, 0.0, 1.0);
+    scene_confirmed_probability = clamp(confirmed_mass, 0.0, 1.0);
+    scene_fast_strength = smoothstep(0.20, 0.80, scene_short_probability);
+    scene_hard_cut = scene_new_probability >= DSM_CUT_PROBABILITY ||
+                     scene_confirmed_probability >= DSM_CUT_PROBABILITY ? 1u : 0u;
+    dsm_accepted_age = scene_hard_cut > 0u ? 0.0 : accepted_age;
+
+    // At most 33 candidates: stable rank selection is cheaper to audit
+    // than a padded network. Always retain the new hypothesis at slot zero.
+    dsm_next_count = min(dsm_old_count + 1u, DSM_CAPACITY);
+    dsm_selected[0] = dsm_old_count;
+    for (uint i = 0u; i < dsm_old_count; i++) {
+        uint rank = 1u;
+        for (uint j = 0u; j < dsm_old_count; j++) {
+            if (dsm_logits[j] > dsm_logits[i] ||
+                (dsm_logits[j] == dsm_logits[i] && j < i)) {
+                rank++;
+            }
         }
-        // Pending reversals decay old evidence; confirmed ones rebase below.
-        target = 0.0;
+        if (rank < DSM_CAPACITY) {
+            dsm_selected[rank] = i;
+        }
     }
-    float response_alpha = initialize ? 1.0 : temporal_alpha(
-        temporal_delta_time,
-        temporal_stable_duration * TEMPORAL_EVIDENCE_TIME_SCALE
-    );
-    metered_response_evidence = mix(evidence, target, response_alpha);
-    metered_response_confidence = smoothstep(
-        0.5, 1.0, metered_response_evidence
-    );
-    metered_reference_zones_valid = 1u;
-}
-
-void temporal_rebase_zone_references(uint index) {
-    for (uint zone = index; zone < TEMPORAL_ZONE_COUNT;
-         zone += TEMPORAL_HISTOGRAM_SIZE) {
-        metered_reference_zones[zone] = metered_zone_average[zone];
+    float kept = 0.0;
+    for (uint i = 0u; i < dsm_next_count; i++) {
+        kept += exp(dsm_logits[dsm_selected[i]] - largest);
     }
+    dsm_log_kept = largest + log(kept);
+    scene_discarded_mass = clamp(1.0 - kept / total, 0.0, 1.0);
 }
 
-// Scale the scene-change interval with the common minimum time constant.
-float temporal_scene_time(float time_scale) {
-    return max(
-        temporal_stable_duration * time_scale,
-        TEMPORAL_MIN_TIME_CONSTANT
-    );
-}
-
-void temporal_update_fast_response() {
-    if (metered_scene_fast_response == 0u) {
+void dsm_write(uint index) {
+    uint count = dsm_next_count;
+    if (index >= count) {
         return;
     }
-
-    float end_pts = pts_to_float(metered_scene_adaptation_end_pts);
-    if (PTS >= end_pts) {
-        metered_scene_fast_response = 0u;
+    uint selected = dsm_operation == 1u ? 0u : dsm_selected[index];
+    bool prior = dsm_operation == 1u || selected == dsm_old_count;
+    uint source = dsm_read_bank * DSM_CAPACITY + selected;
+    uint target = (1u - dsm_read_bank) * DSM_CAPACITY + index;
+    dsm_weights[target] = dsm_operation == 1u ? 0.0 :
+                          dsm_logits[selected] - dsm_log_kept;
+    dsm_age[target] = prior ? 0.0 : dsm_ages[selected];
+    for (uint d = 0u; d < 4u; d++) {
+        float prec = prior ? DSM_PRIOR_PRECISION : dsm_precision[source * 4u + d];
+        float information = prior ? 0.0 : dsm_information[source * 4u + d];
+        dsm_precision[target * 4u + d] = prec + dsm_precision_step[d];
+        dsm_information[target * 4u + d] = information + dsm_information_step[d];
     }
 }
 
-float temporal_expected_scene_distance() {
-    float speed = finite_float(metered_scene_speed)
-        ? max(metered_scene_speed, 0.0) : 0.0;
-    // Do not let old motion explain away arbitrarily large new transitions.
-    return min(speed * temporal_delta_time, TEMPORAL_HISTOGRAM_CUT_THRESHOLD);
-}
-
-bool temporal_detect_scene_cut(
-    float reference_distance,
-    float unexpected_distance
-) {
-    // Expected distance is nonnegative, so the residual also bounds frame distance.
-    return reference_distance > TEMPORAL_HISTOGRAM_CUT_THRESHOLD &&
-           unexpected_distance > TEMPORAL_HISTOGRAM_FRAME_THRESHOLD;
-}
-
-// Commit the accepted cut to metering state. Metadata translates this event
-// into exposure resets and reset instructions for the curve LUT pass.
-void temporal_accept_scene_cut() {
-    temporal_reset_zone_response();
-    metered_scene_cut_detected = 1u;
-    metered_scene_speed = 0.0;
-    metered_scene_adaptation_end_pts = pts_to_uint(
-        PTS + temporal_scene_time(TEMPORAL_SCENE_ADAPTATION_TIME_SCALE)
-    );
-    metered_scene_fast_response = 1u;
-    temporal_reference_operation = TEMPORAL_REFERENCE_REPLACE;
-}
-
-void temporal_update_scene_speed(float frame_distance, float expected_distance) {
-    float speed = finite_float(metered_scene_speed)
-        ? max(metered_scene_speed, 0.0) : 0.0;
-    // Winsorize positive innovations in distance units before learning the
-    // speed, limiting how strongly a flash outside the cut gate raises it.
-    float limited_distance = min(
-        frame_distance,
-        expected_distance + TEMPORAL_HISTOGRAM_FRAME_THRESHOLD
-    );
-    float observed_speed = max(limited_distance, 0.0) / temporal_delta_time;
-    float alpha = temporal_alpha(
-        temporal_delta_time, temporal_stable_duration * TEMPORAL_SCENE_SPEED_TIME_SCALE
-    );
-    metered_scene_speed = mix(speed, observed_speed, alpha);
-}
-
-void temporal_process_distances(vec2 distance) {
-    float reference_distance = distance.x;
-    float frame_distance = distance.y;
-    // Predict from the old trend before learning the current observation.
-    float expected_distance = temporal_expected_scene_distance();
-    float unexpected_distance = frame_distance - expected_distance;
-    bool cut = temporal_stable_scene_change > 0 && temporal_detect_scene_cut(
-        reference_distance, unexpected_distance
-    );
-    if (cut) {
-        // Reset both output histories on the first detected discontinuity.
-        // Waiting for persistence would render the new shot with old mapping.
-        // A flash crossing these gates also resets; past brightness statistics
-        // alone cannot distinguish its first edge from a cut.
-        temporal_accept_scene_cut();
-        return;
-    }
-
-    temporal_update_scene_speed(frame_distance, expected_distance);
-    temporal_reference_operation = TEMPORAL_REFERENCE_BLEND;
-    temporal_reference_alpha = temporal_reference_blend_alpha(temporal_delta_time);
-}
-
-void temporal_prepare_frame() {
-    temporal_frame_operation = TEMPORAL_FRAME_SKIP;
-    temporal_reference_operation = TEMPORAL_REFERENCE_KEEP;
-    temporal_zones_available = metered_zones_valid;
-
-    if (!finite_float(PTS)) {
-        // Skip histogram learning on invalid PTS; the next finite PTS
-        // initializes the reference and previous-frame distributions.
-        temporal_set_scalar_state(0u);
-        return;
-    }
-
-    if (metered_temporal_valid == 0u) {
-        temporal_initialize_frame();
-        return;
-    }
-
-    float previous_pts = pts_to_float(metered_temporal_pts);
-    float delta_time = PTS - previous_pts;
-
-    // Redrawing the same video frame must not advance temporal state.
-    if (abs(delta_time) <= TEMPORAL_PTS_EPSILON) {
-        return;
-    }
-
-    if (delta_time < 0.0 || delta_time > temporal_stable_duration) {
-        temporal_initialize_frame();
-        return;
-    }
-
-    metered_scene_cut_detected = 0u;
-    temporal_delta_time = delta_time;
-    metered_temporal_pts = pts_to_uint(PTS);
-    temporal_update_fast_response();
-    temporal_frame_operation = TEMPORAL_FRAME_PROCESS;
-}
-
-void temporal_initialize_histogram(uint index, float current) {
-    metered_reference_histogram[index] = current;
-    metered_previous_histogram[index] = current;
-}
-
-void temporal_update_reference_bin(uint index, float current) {
-    if (temporal_reference_operation == TEMPORAL_REFERENCE_BLEND) {
-        // Replace non-finite history instead of propagating it through mix().
-        float reference = metered_reference_histogram[index];
-        metered_reference_histogram[index] = finite_float(reference)
-            ? mix(reference, current, temporal_reference_alpha)
-            : current;
-    } else if (
-        temporal_reference_operation == TEMPORAL_REFERENCE_REPLACE
-    ) {
-        metered_reference_histogram[index] = current;
-    }
-}
-
-void analyze_metering_temporally() {
-    uint index = gl_LocalInvocationIndex;
-
-    if (index == 0u) {
-        temporal_prepare_frame();
+void hook() {
+    uint tid = gl_LocalInvocationIndex;
+    if (tid == 0u) {
+        dsm_prepare();
     }
     barrier();
-
-    if (temporal_frame_operation == TEMPORAL_FRAME_SKIP) {
+    if (dsm_operation == 0u) {
         return;
     }
-
-    bool zones_available = temporal_zones_available > 0u;
-    bool initialize = temporal_frame_operation == TEMPORAL_FRAME_INITIALIZE ||
-                      metered_reference_zones_valid == 0u;
-    vec2 support = zones_available
-        ? temporal_update_zone_references(index, initialize) : vec2(0.0);
-    float current = temporal_histogram_value(index);
-    bool process = temporal_frame_operation == TEMPORAL_FRAME_PROCESS;
-    vec2 distance = vec2(0.0);
-    if (process) {
-        vec2 delta = temporal_measure_delta_and_update_previous(index, current);
-        temporal_scan_distribution_delta(index, delta);
-        distance = temporal_cdf_distance(index);
+    if (dsm_operation == 2u) {
+        dsm_candidate(tid);
     }
-    if (process || zones_available) {
-        temporal_reduce_statistics(index, distance, support);
-    }
-
-    // Zone evidence still precedes cut acceptance, which may reset it.
-    if (index == 0u) {
-        if (zones_available) {
-            temporal_update_zone_evidence(initialize);
+    barrier();
+    if (tid == 0u) {
+        if (dsm_bad_history > 0u) {
+            dsm_operation = 1u;
+            scene_state_recovered = 1u;
+        }
+        if (dsm_operation == 1u) {
+            dsm_next_count = 1u;
+            dsm_accepted_age = 0.0;
+            scene_bootstrap = 1u;
         } else {
-            temporal_reset_zone_response();
+            dsm_select();
         }
     }
     barrier();
-    if (zones_available && temporal_zone_reversed) {
-        temporal_rebase_zone_references(index);
-    }
-
-    if (!process) {
-        temporal_initialize_histogram(index, current);
-        return;
-    }
-    if (index == 0u) {
-        temporal_process_distances(temporal_partial[0].xy);
-    }
+    dsm_write(tid);
+    memoryBarrierBuffer();
     barrier();
-
-    temporal_update_reference_bin(index, current);
+    if (tid == 0u) {
+        dsm_bank = 1u - dsm_read_bank;
+        dsm_count = dsm_next_count;
+        dsm_last_pts = floatBitsToUint(PTS);
+        dsm_valid = 1u;
+        scene_observation_valid = 1u;
+    }
 }
 
-void hook() { analyze_metering_temporally(); }
 
 //!HOOK OUTPUT
 //!BIND METERED
-//!BIND METERED_TEMPORAL
+//!BIND SCENE_RESPONSE
 //!BIND EXPOSURE_TEMPORAL
 //!BIND CURVE_TEMPORAL
 //!BIND METADATA
@@ -2462,35 +2288,24 @@ float resolve_exposure(MeteringMetrics metrics) {
     return calculate_auto_exposure(metrics);
 }
 
-// Resolve once per metadata pass. Only current, selected measurements may
-// influence output history; preview-only or stale metering must not do so.
-// Acceleration weight combining zone confidence and the post-cut fast window.
+// Resolve once per metadata pass. Source scene statistics remain independent
+// of HDR metadata selection; only current events may affect output history.
 float output_response_weight;
 bool output_scene_cut;
 
 void prepare_output_temporal_response() {
     output_response_weight = 0.0;
     output_scene_cut = false;
-    bool current = temporal_stable_duration > 0.0 &&
-                   measured_metering_enabled() && metered_temporal_valid > 0u &&
-                   finite_float(PTS) &&
-                   abs(PTS - uintBitsToFloat(metered_temporal_pts)) <=
+    // Events stay latched for redraws; exposure/curve consume each PTS once.
+    bool current = temporal_stable_duration > 0.0 && enable_metering > 0u &&
+                   temporal_stable_scene_change > 0u &&
+                   scene_observation_valid > 0u && finite_float(PTS) &&
+                   abs(PTS - uintBitsToFloat(scene_observation_pts)) <=
                        EXPOSURE_PTS_EPSILON;
-    if (!current) {
-        return;
-    }
-
-    output_scene_cut = temporal_stable_scene_change > 0u &&
-                       metered_scene_cut_detected > 0u;
-    bool fast_response = temporal_stable_scene_change > 0u &&
-                         metered_scene_fast_response > 0u &&
-                         PTS < uintBitsToFloat(metered_scene_adaptation_end_pts);
-    output_response_weight = fast_response ? 1.0 : 0.0;
-    if (full_metering_enabled() && metered_reference_zones_valid > 0u &&
-        finite_float(metered_response_confidence)) {
-        output_response_weight = max(
-            output_response_weight, clamp(metered_response_confidence, 0.0, 1.0)
-        );
+    if (current) {
+        output_scene_cut = scene_hard_cut > 0u;
+        output_response_weight = finite_float(scene_fast_strength)
+            ? clamp(scene_fast_strength, 0.0, 1.0) : 0.0;
     }
 }
 
@@ -4071,7 +3886,6 @@ vec4 hook() {
 
 //!HOOK OUTPUT
 //!BIND METERED
-//!BIND METERED_TEMPORAL
 //!BIND METADATA
 //!BIND LUTS
 //!BIND PREVIEW_HISTOGRAM
@@ -4246,25 +4060,6 @@ float preview_histogram_count(vec2 source_interval) {
     return count;
 }
 
-float preview_reference_histogram_count(
-    vec2 source_interval,
-    float total
-) {
-    vec2 interval = source_interval * float(PREVIEW_HISTOGRAM_SIZE);
-    uvec2 bounds = histogram_interval_bounds(
-        interval,
-        PREVIEW_HISTOGRAM_SIZE
-    );
-    float count = 0.0;
-
-    for (uint i = bounds.x; i < bounds.y; i++) {
-        float overlap = histogram_bin_overlap(interval, i);
-        count += metered_reference_histogram[i] * total * overlap;
-    }
-
-    return count;
-}
-
 float preview_histogram_height(float count, float total) {
     return log2(1.0 + count) / max(log2(1.0 + total), 1e-6);
 }
@@ -4273,17 +4068,8 @@ void prepare_preview_histogram_bin(uint index) {
     float total = float(PREVIEW_HISTOGRAM_SAMPLE_COUNT);
     vec2 source_interval = preview_histogram_source_interval(index);
     float current_count = preview_histogram_count(source_interval);
-    bool temporal_reference_valid = temporal_stable_duration > 0.0 &&
-                                    metered_temporal_valid > 0u;
-    float reference_count = temporal_reference_valid
-        ? preview_reference_histogram_count(source_interval, total)
-        : current_count;
     preview_histogram_current[index] = preview_histogram_height(
         current_count,
-        total
-    );
-    preview_histogram_reference[index] = preview_histogram_height(
-        reference_count,
         total
     );
 }
@@ -4589,10 +4375,8 @@ const float SCALE = 4.0;
 const float LINE_H = CHAR_H + 2.0;
 const float GAP = 6.0 * SCALE;
 
-// The preview histogram uses the same 64-bin grouping as scene-change
-// detection. Cyan bars are the current frame, the orange trace is the
-// timestamp-smoothed reference, and the yellow curve is the J-domain LUT
-// transformed onto the same PQ horizontal and vertical axes.
+// Cyan bars show the current frame in 64 bins. The yellow curve is the
+// J-domain LUT transformed onto the same PQ horizontal and vertical axes.
 const uint PREVIEW_HISTOGRAM_SIZE = 64u;
 const float PREVIEW_HISTOGRAM_BIN_WIDTH = 4.0;
 const float PREVIEW_HISTOGRAM_EXTENT = 256.0;
@@ -4789,7 +4573,6 @@ vec4 draw_histogram(vec2 px) {
         uint(PREVIEW_HISTOGRAM_EXTENT) - 1u
     );
     float current_height = preview_histogram_current[index];
-    float reference_height = preview_histogram_reference[index];
     float plot_width = PREVIEW_HISTOGRAM_EXTENT - 2.0;
     float plot_height = PREVIEW_HISTOGRAM_EXTENT - 2.0;
     float pq_input = clamp((local.x - 1.0) / plot_width, 0.0, 1.0);
@@ -4805,10 +4588,6 @@ vec4 draw_histogram(vec2 px) {
 
     if (level <= current_height) {
         tint = vec3(0.12, 0.72, 0.92);
-    }
-
-    if (abs(level - reference_height) <= 1.5 / plot_height) {
-        tint = vec3(1.0, 0.55, 0.12);
     }
 
     if (abs(level - pq_input) <= 0.75 / plot_height) {
