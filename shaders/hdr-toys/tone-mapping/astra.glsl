@@ -190,6 +190,9 @@
 //!VAR uint metered_median_i
 //!VAR uint metered_diffuse_white_i
 //!VAR uint metered_histogram[1024]
+//!VAR uint metered_histogram_count
+//!VAR uint metered_scene_median_bin
+//!VAR uint metered_scene_diffuse_white_bin
 //!VAR float metered_zone_average[144]
 //!VAR float metered_zone_spread[144]
 //!VAR float metered_zone_preview_weight[144]
@@ -991,6 +994,8 @@ shared uint black_bin;
 shared uint white_bin;
 shared uint median_bin;
 shared uint diffuse_white_bin;
+shared uint scene_median_bin;
+shared uint scene_diffuse_white_bin;
 
 shared vec2 matrix_partial[METERING_REDUCTION_SIZE];
 shared uvec4 matrix_active_bounds;
@@ -1450,6 +1455,24 @@ void locate_percentiles(uint tid, uint first, uvec4 counts) {
             diffuse_white_target
         );
     }
+
+    // DSM uses the actual histogram count and bin centers on a 1024-step
+    // scale. Reuse this prefix scan without changing the exposure quantiles.
+    uint total = histogram_scan[0][METERING_REDUCTION_SIZE - 1u];
+    uint scene_median_target = percentile_target(total, 0.5);
+    uint scene_diffuse_white_target = percentile_target(total, 0.8);
+    if (cumulative_before < scene_median_target &&
+        cumulative >= scene_median_target) {
+        scene_median_bin = find_percentile_bin(
+            counts, first, cumulative_before, scene_median_target
+        );
+    }
+    if (cumulative_before < scene_diffuse_white_target &&
+        cumulative >= scene_diffuse_white_target) {
+        scene_diffuse_white_bin = find_percentile_bin(
+            counts, first, cumulative_before, scene_diffuse_white_target
+        );
+    }
 }
 
 void reduce_histogram_statistics(
@@ -1462,6 +1485,8 @@ void reduce_histogram_statistics(
         white_bin = METERING_HISTOGRAM_SIZE - 1u;
         median_bin = 0u;
         diffuse_white_bin = METERING_HISTOGRAM_SIZE - 1u;
+        scene_median_bin = 0u;
+        scene_diffuse_white_bin = 0u;
     }
 
     scan_histogram_blocks(tid, sum_histogram_block(counts));
@@ -1483,6 +1508,9 @@ void reduce_histogram_statistics(
 
     if (tid == 0u) {
         uint global_retained = global_targets.y - global_targets.x;
+        metered_histogram_count = global_total;
+        metered_scene_median_bin = scene_median_bin;
+        metered_scene_diffuse_white_bin = scene_diffuse_white_bin;
         histogram_average = average_partial[0] /
                             float(max(global_retained, 1u));
         metered_min_i = black_bin << 2u;
@@ -1604,29 +1632,12 @@ void dsm_prepare() {
 
     // This pass runs even when disabled to invalidate dormant history. The
     // intensity-map gate guarantees fresh measurements when DSM is enabled.
-    uint total = 0u;
-    for (uint i = 0u; i < 1024u; i++) {
-        total += metered_histogram[i];
-    }
-    if (total == 0u || !dsm_finite(metered_histogram_average) ||
+    if (metered_histogram_count == 0u || !dsm_finite(metered_histogram_average) ||
         metered_histogram_average < 0.0 || metered_histogram_average > 1.0) {
         return;
     }
-    uint cumulative = 0u;
-    uint p50 = 0u;
-    uint p80 = 0u;
-    uint target50 = uint(ceil(0.5 * float(total)));
-    uint target80 = uint(ceil(0.8 * float(total)));
-    for (uint i = 0u; i < 1024u; i++) {
-        uint before = cumulative;
-        cumulative += metered_histogram[i];
-        if (before < target50 && cumulative >= target50) {
-            p50 = i;
-        }
-        if (before < target80 && cumulative >= target80) {
-            p80 = i;
-        }
-    }
+    uint p50 = metered_scene_median_bin;
+    uint p80 = metered_scene_diffuse_white_bin;
     bool matrix_valid = metered_zones_valid > 0u &&
                         metered_matrix_blend > 0.0 &&
                         dsm_finite(metered_matrix_average) &&
@@ -1710,6 +1721,28 @@ void dsm_candidate(uint index) {
     }
 }
 
+void dsm_rank(uint index) {
+    if (index == 0u) {
+        dsm_next_count = min(dsm_old_count + 1u, DSM_CAPACITY);
+        dsm_selected[0] = dsm_old_count;
+    }
+    if (index >= dsm_old_count) {
+        return;
+    }
+    // Each old hypothesis owns one unique rank; ties retain index order.
+    // Slot zero always retains the new hypothesis, regardless of its weight.
+    uint rank = 1u;
+    for (uint j = 0u; j < dsm_old_count; j++) {
+        if (dsm_logits[j] > dsm_logits[index] ||
+            (dsm_logits[j] == dsm_logits[index] && j < index)) {
+            rank++;
+        }
+    }
+    if (rank < DSM_CAPACITY) {
+        dsm_selected[rank] = index;
+    }
+}
+
 void dsm_select() {
     // Responsibility of the shared contamination component under the OLD
     // mixture, before this observation is learned. This is not a cut probability.
@@ -1763,22 +1796,6 @@ void dsm_select() {
                      scene_confirmed_probability >= DSM_CUT_PROBABILITY ? 1u : 0u;
     dsm_accepted_age = scene_hard_cut > 0u ? 0.0 : accepted_age;
 
-    // At most 33 candidates: stable rank selection is cheaper to audit
-    // than a padded network. Always retain the new hypothesis at slot zero.
-    dsm_next_count = min(dsm_old_count + 1u, DSM_CAPACITY);
-    dsm_selected[0] = dsm_old_count;
-    for (uint i = 0u; i < dsm_old_count; i++) {
-        uint rank = 1u;
-        for (uint j = 0u; j < dsm_old_count; j++) {
-            if (dsm_logits[j] > dsm_logits[i] ||
-                (dsm_logits[j] == dsm_logits[i] && j < i)) {
-                rank++;
-            }
-        }
-        if (rank < DSM_CAPACITY) {
-            dsm_selected[rank] = i;
-        }
-    }
     float kept = 0.0;
     for (uint i = 0u; i < dsm_next_count; i++) {
         kept += exp(dsm_logits[dsm_selected[i]] - largest);
@@ -1818,6 +1835,10 @@ void hook() {
     }
     if (dsm_operation == 2u) {
         dsm_candidate(tid);
+    }
+    barrier();
+    if (dsm_operation == 2u && dsm_bad_history == 0u) {
+        dsm_rank(tid);
     }
     barrier();
     if (tid == 0u) {
