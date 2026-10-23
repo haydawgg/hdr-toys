@@ -1882,10 +1882,9 @@ const float EXPOSURE_WOLF_OUTLIER_EV = 0.5;
 const float EXPOSURE_WOLF_VARIANCE_MIN = 1e-6;
 const float EXPOSURE_WOLF_VARIANCE_MAX = 1e6;
 
-// Limit transient excess exposure before a bright cut has been confirmed.
+// Apply the current target in either direction while a large cut is unconfirmed.
 const float EXPOSURE_PROTECTION_PROBABILITY = 0.95;
 const float EXPOSURE_PROTECTION_TRIGGER_EV = 0.75;
-const float EXPOSURE_PROTECTION_MARGIN_EV = 0.25;
 
 // Scene probability selects the faster exposure and curve response scales.
 const float OUTPUT_TEMPORAL_SCENE_TIME_SCALE = 0.125;
@@ -2346,10 +2345,9 @@ float protect_auto_exposure(float filtered, float target, bool automatic) {
     target = clamp(target, -64.0, 64.0);
     output_exposure_protected =
         output_outlier_probability >= EXPOSURE_PROTECTION_PROBABILITY &&
-        filtered - target >= EXPOSURE_PROTECTION_TRIGGER_EV;
-    // Projection affects this frame's rendering, never the WoLF state.
-    return output_exposure_protected
-        ? min(filtered, target + EXPOSURE_PROTECTION_MARGIN_EV) : filtered;
+        abs(filtered - target) >= EXPOSURE_PROTECTION_TRIGGER_EV;
+    // Use the same EV as a confirmed cut, without writing the WoLF state.
+    return output_exposure_protected ? target : filtered;
 }
 
 float output_temporal_time_scale(float normal_scale, float response_scale) {
