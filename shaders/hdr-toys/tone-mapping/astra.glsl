@@ -218,6 +218,7 @@
 //!VAR float scene_fast_strength
 //!VAR float scene_discarded_mass
 //!VAR float scene_outlier_probability
+//!VAR float scene_change_log_bayes
 //!VAR uint scene_hard_cut
 //!VAR uint scene_bootstrap
 //!VAR uint scene_observation_pts
@@ -1578,6 +1579,7 @@ void dsm_clear_response() {
     scene_fast_strength = 0.0;
     scene_discarded_mass = 0.0;
     scene_outlier_probability = 0.0;
+    scene_change_log_bayes = 0.0;
     scene_hard_cut = 0u;
     scene_bootstrap = 0u;
     scene_observation_valid = 0u;
@@ -1724,6 +1726,10 @@ void dsm_select() {
     scene_outlier_probability = clamp(
         exp(dsm_log_outlier - log_old_predictive), 0.0, 1.0
     );
+    // Compare predictive explanations before the time-based cut prior. This
+    // evidence can drive temporary exposure protection without confirming a cut.
+    scene_change_log_bayes = dsm_logits[dsm_old_count] - dsm_log_hazard -
+                             log_old_predictive;
 
     float largest = dsm_logits[0];
     for (uint i = 1u; i <= dsm_old_count; i++) {
@@ -1882,9 +1888,9 @@ const float EXPOSURE_WOLF_OUTLIER_EV = 0.5;
 const float EXPOSURE_WOLF_VARIANCE_MIN = 1e-6;
 const float EXPOSURE_WOLF_VARIANCE_MAX = 1e6;
 
-// Apply the current target in either direction while a large cut is unconfirmed.
-const float EXPOSURE_PROTECTION_PROBABILITY = 0.95;
-const float EXPOSURE_PROTECTION_TRIGGER_EV = 0.75;
+// Protect a large EV mismatch when new-scene prediction is at least 4x likelier.
+const float EXPOSURE_PROTECTION_LOG_BAYES = 1.3862943611198906;
+const float EXPOSURE_PROTECTION_TRIGGER_EV = 0.5;
 
 // Scene probability selects the faster exposure and curve response scales.
 const float OUTPUT_TEMPORAL_SCENE_TIME_SCALE = 0.125;
@@ -2314,13 +2320,13 @@ float resolve_exposure(MeteringMetrics metrics) {
 // of HDR metadata selection; only current events may affect output history.
 float output_response_weight;
 bool output_scene_cut;
-float output_outlier_probability;
+float output_change_log_bayes;
 bool output_exposure_protected;
 
 void prepare_output_temporal_response() {
     output_response_weight = 0.0;
     output_scene_cut = false;
-    output_outlier_probability = 0.0;
+    output_change_log_bayes = 0.0;
     output_exposure_protected = false;
     // Events stay latched for redraws; exposure/curve consume each PTS once.
     bool current = temporal_stable_duration > 0.0 && enable_metering > 0u &&
@@ -2332,8 +2338,8 @@ void prepare_output_temporal_response() {
         output_scene_cut = scene_hard_cut > 0u;
         output_response_weight = finite_float(scene_fast_strength)
             ? clamp(scene_fast_strength, 0.0, 1.0) : 0.0;
-        output_outlier_probability = finite_float(scene_outlier_probability)
-            ? clamp(scene_outlier_probability, 0.0, 1.0) : 0.0;
+        output_change_log_bayes = finite_float(scene_change_log_bayes)
+            ? scene_change_log_bayes : 0.0;
     }
 }
 
@@ -2344,7 +2350,7 @@ float protect_auto_exposure(float filtered, float target, bool automatic) {
     }
     target = clamp(target, -64.0, 64.0);
     output_exposure_protected =
-        output_outlier_probability >= EXPOSURE_PROTECTION_PROBABILITY &&
+        output_change_log_bayes >= EXPOSURE_PROTECTION_LOG_BAYES &&
         abs(filtered - target) >= EXPOSURE_PROTECTION_TRIGGER_EV;
     // Use the same EV as a confirmed cut, without writing the WoLF state.
     return output_exposure_protected ? target : filtered;
