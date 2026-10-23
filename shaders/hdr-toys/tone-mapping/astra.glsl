@@ -217,6 +217,7 @@
 //!VAR float scene_confirmed_probability
 //!VAR float scene_fast_strength
 //!VAR float scene_discarded_mass
+//!VAR float scene_outlier_probability
 //!VAR uint scene_hard_cut
 //!VAR uint scene_bootstrap
 //!VAR uint scene_observation_pts
@@ -235,6 +236,7 @@
 //!VAR float curve_temporal_values[1024]
 //!VAR float curve_temporal_alpha
 //!VAR uint curve_temporal_reset
+//!VAR uint curve_temporal_bypass
 //!VAR uint curve_temporal_pts
 //!VAR uint curve_temporal_valid
 //!STORAGE
@@ -1563,6 +1565,7 @@ shared uint dsm_bad_history;
 shared float dsm_dt;
 shared float dsm_log_hazard;
 shared float dsm_log_kept;
+shared float dsm_log_outlier;
 
 bool dsm_finite(float x) {
     return !isnan(x) && !isinf(x);
@@ -1574,6 +1577,7 @@ void dsm_clear_response() {
     scene_confirmed_probability = 0.0;
     scene_fast_strength = 0.0;
     scene_discarded_mass = 0.0;
+    scene_outlier_probability = 0.0;
     scene_hard_cut = 0u;
     scene_bootstrap = 0u;
     scene_observation_valid = 0u;
@@ -1630,6 +1634,10 @@ void dsm_prepare() {
                   (float(p50) + 0.5) / 1024.0,
                   (float(p80) + 0.5) / 1024.0,
                   matrix_valid ? metered_matrix_average : 0.5) - 0.5) * 10.0;
+    dsm_log_outlier = log(DSM_CONTAMINATION) - 0.5 * dot(dsm_mask,
+        vec4(log(6.283185307179586 * DSM_OUTLIER_VARIANCE)) +
+        dsm_z * dsm_z / DSM_OUTLIER_VARIANCE
+    );
     vec4 a = 1.0 / (1.0 + dsm_z * dsm_z / 9.0);
     vec4 derivative = -2.0 * dsm_z * a * a / 9.0;
     // omega=sigma²/2: prec += a/sigma², information += a*z/sigma²-a'.
@@ -1661,12 +1669,8 @@ float dsm_predictive(vec4 prec, vec4 information) {
     float normal = -0.5 * dot(dsm_mask,
         log(6.283185307179586 * variance) + residual * residual / variance
     ) + log(1.0 - DSM_CONTAMINATION);
-    float outlier = -0.5 * dot(dsm_mask,
-        vec4(log(6.283185307179586 * DSM_OUTLIER_VARIANCE)) +
-        dsm_z * dsm_z / DSM_OUTLIER_VARIANCE
-    ) + log(DSM_CONTAMINATION);
-    float largest = max(normal, outlier);
-    return largest + log(exp(normal - largest) + exp(outlier - largest));
+    float largest = max(normal, dsm_log_outlier);
+    return largest + log(exp(normal - largest) + exp(dsm_log_outlier - largest));
 }
 
 void dsm_candidate(uint index) {
@@ -1705,6 +1709,22 @@ void dsm_candidate(uint index) {
 }
 
 void dsm_select() {
+    // Responsibility of the shared contamination component under the OLD
+    // mixture, before this observation is learned. This is not a cut probability.
+    float old_largest = dsm_logits[0];
+    for (uint i = 1u; i < dsm_old_count; i++) {
+        old_largest = max(old_largest, dsm_logits[i]);
+    }
+    float old_total = 0.0;
+    for (uint i = 0u; i < dsm_old_count; i++) {
+        old_total += exp(dsm_logits[i] - old_largest);
+    }
+    float log_old_predictive = old_largest + log(old_total) +
+                               dsm_dt / DSM_SHOT_SECONDS;
+    scene_outlier_probability = clamp(
+        exp(dsm_log_outlier - log_old_predictive), 0.0, 1.0
+    );
+
     float largest = dsm_logits[0];
     for (uint i = 1u; i <= dsm_old_count; i++) {
         largest = max(largest, dsm_logits[i]);
@@ -1848,8 +1868,7 @@ void hook() {
 const float AUTO_EXPOSURE_WHITE_CONSTRAINT = 0.25;
 const float AUTO_EXPOSURE_HEADROOM_RETENTION = 0.5;
 
-// Match the temporal pass's minimum time constant for both the exposure
-// integrator and the curve LUT ramp.
+// Shared minimum time constant for the exposure integrator and curve LUT ramp.
 const float TEMPORAL_MIN_TIME_CONSTANT = 1.0 / 240.0;
 
 // Filter automatic exposure in its final EV domain so observation noise cannot
@@ -1863,8 +1882,12 @@ const float EXPOSURE_WOLF_OUTLIER_EV = 0.5;
 const float EXPOSURE_WOLF_VARIANCE_MIN = 1e-6;
 const float EXPOSURE_WOLF_VARIANCE_MAX = 1e6;
 
-// Fast-response window after a scene change: the duration scales the
-// stabilization interval and the time scale clamps the ramp.
+// Limit transient excess exposure before a bright cut has been confirmed.
+const float EXPOSURE_PROTECTION_PROBABILITY = 0.95;
+const float EXPOSURE_PROTECTION_TRIGGER_EV = 0.75;
+const float EXPOSURE_PROTECTION_MARGIN_EV = 0.25;
+
+// Scene probability selects the faster exposure and curve response scales.
 const float OUTPUT_TEMPORAL_SCENE_TIME_SCALE = 0.125;
 const float CURVE_TEMPORAL_RESPONSE_TIME_SCALE = 0.0625;
 
@@ -2292,10 +2315,14 @@ float resolve_exposure(MeteringMetrics metrics) {
 // of HDR metadata selection; only current events may affect output history.
 float output_response_weight;
 bool output_scene_cut;
+float output_outlier_probability;
+bool output_exposure_protected;
 
 void prepare_output_temporal_response() {
     output_response_weight = 0.0;
     output_scene_cut = false;
+    output_outlier_probability = 0.0;
+    output_exposure_protected = false;
     // Events stay latched for redraws; exposure/curve consume each PTS once.
     bool current = temporal_stable_duration > 0.0 && enable_metering > 0u &&
                    temporal_stable_scene_change > 0u &&
@@ -2306,7 +2333,23 @@ void prepare_output_temporal_response() {
         output_scene_cut = scene_hard_cut > 0u;
         output_response_weight = finite_float(scene_fast_strength)
             ? clamp(scene_fast_strength, 0.0, 1.0) : 0.0;
+        output_outlier_probability = finite_float(scene_outlier_probability)
+            ? clamp(scene_outlier_probability, 0.0, 1.0) : 0.0;
     }
+}
+
+float protect_auto_exposure(float filtered, float target, bool automatic) {
+    output_exposure_protected = false;
+    if (!automatic || !finite_float(target)) {
+        return filtered;
+    }
+    target = clamp(target, -64.0, 64.0);
+    output_exposure_protected =
+        output_outlier_probability >= EXPOSURE_PROTECTION_PROBABILITY &&
+        filtered - target >= EXPOSURE_PROTECTION_TRIGGER_EV;
+    // Projection affects this frame's rendering, never the WoLF state.
+    return output_exposure_protected
+        ? min(filtered, target + EXPOSURE_PROTECTION_MARGIN_EV) : filtered;
 }
 
 float output_temporal_time_scale(float normal_scale, float response_scale) {
@@ -2425,6 +2468,7 @@ void record_curve_temporal_pts() {
 
 void prepare_curve_temporal() {
     curve_temporal_reset = 1u;
+    curve_temporal_bypass = 0u;
 
     if (!finite_float(PTS)) {
         // Keep reset active on invalid PTS and on the next finite-PTS frame.
@@ -2435,6 +2479,15 @@ void prepare_curve_temporal() {
 
     if (temporal_stable_duration <= 0.0) {
         record_curve_temporal_pts();
+        return;
+    }
+
+    if (output_exposure_protected) {
+        // Render the protected frame with its own curve. Keep both the old
+        // LUT history and its timestamp for a flash return or a confirmed cut.
+        curve_temporal_bypass = 1u;
+        curve_temporal_reset = 0u;
+        curve_temporal_alpha = 0.0;
         return;
     }
 
@@ -2516,16 +2569,15 @@ void publish_output_lightness_range() {
 
 void update_metering_metadata() {
     prepare_output_temporal_response();
-    prepare_curve_temporal();
     publish_output_lightness_range();
 
     MeteringMetrics metrics = resolve_metering_metrics();
     publish_input_metering_metadata(metrics);
     float target_ev = resolve_exposure(metrics);
-    exposure_ev = stabilize_auto_exposure(
-        target_ev,
-        automatic_exposure_enabled(metrics)
-    );
+    bool automatic = automatic_exposure_enabled(metrics);
+    float filtered_ev = stabilize_auto_exposure(target_ev, automatic);
+    exposure_ev = protect_auto_exposure(filtered_ev, target_ev, automatic);
+    prepare_curve_temporal();
     // Apply manual EV compensation after smoothing so it stays immediate and
     // does not enter automatic-exposure history. Bound the combined exposure.
     exposure_ev = clamp(exposure_ev + exposure_value_offset, -64.0, 64.0);
@@ -3057,6 +3109,9 @@ bool finite_float(float value) {
 }
 
 float stabilize_curve_value(int index, float target) {
+    if (curve_temporal_bypass > 0u) {
+        return finite_float(target) ? target : 0.0;
+    }
     // Read history only when reset is inactive.
     bool history_valid = curve_temporal_reset == 0u &&
                          finite_float(curve_temporal_values[index]);
