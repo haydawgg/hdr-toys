@@ -1574,9 +1574,31 @@ void hook() { reduce_metering_statistics(); }
 
 // Before-observation changepoints, diagonal known-variance Gaussian DSM.
 // https://proceedings.mlr.press/v202/altamirano23a.html
+//
+// The new-shot prior is fitted to shot-mean statistics in the eigenbasis of
+// their covariance: mu_w = U^T mu and precision = 1/eigenvalue. The rotation
+// keeps the observation noise isotropic, so the DSM update stays diagonal.
+// These constants are a first calibration from the first half of the
+// validation film; recalibrate on a multi-film corpus before treating them
+// as content-independent.
 const uint DSM_CAPACITY = 32u;
 const float DSM_SIGMA_SQUARED = 0.0625;
-const float DSM_PRIOR_PRECISION = 1.0 / 9.0;
+const vec4 DSM_PRIOR_PRECISION = vec4(
+    20.0, 20.0, 12.07577751, 0.28347464
+);
+const vec4 DSM_PRIOR_INFORMATION = vec4(
+    -0.48453845, -4.1910885, -9.1981883, 0.45147989
+);
+const mat4 DSM_PRIOR_ROTATION = mat4(
+    vec4(0.7886, 0.3150, 0.2151, -0.4823),
+    vec4(-0.1829, -0.6728, 0.4965, -0.5170),
+    vec4(-0.0119, -0.2056, -0.8273, -0.5226),
+    vec4(-0.5870, 0.6370, 0.1510, -0.4763)
+);
+const float DSM_MATRIX_IMPUTATION_Z = 0.02433227;
+// A broad N(0,9) component keeps cuts to unusual shots detectable; the
+// empirical core alone would saturate both hypotheses at the outlier floor.
+const float DSM_PRIOR_BROAD_WEIGHT = 0.1;
 const float DSM_OUTLIER_VARIANCE = 64.0;
 const float DSM_CONTAMINATION = 0.02;
 const float DSM_SHOT_SECONDS = 5.0;
@@ -1601,6 +1623,9 @@ shared float dsm_dt;
 shared float dsm_log_hazard;
 shared float dsm_log_kept;
 shared float dsm_log_outlier;
+shared float dsm_prior_normal;
+shared vec4 dsm_new_prior_precision;
+shared vec4 dsm_new_prior_information;
 
 bool dsm_finite(float x) {
     return !isnan(x) && !isinf(x);
@@ -1648,11 +1673,18 @@ void dsm_prepare() {
                         metered_matrix_blend > 0.0 &&
                         dsm_finite(metered_matrix_average) &&
                         metered_matrix_average >= 0.0 && metered_matrix_average <= 1.0;
-    dsm_mask = vec4(1.0, 1.0, 1.0, matrix_valid ? 1.0 : 0.0);
     dsm_z = (vec4(metered_histogram_average,
                   (float(p50) + 0.5) / 1024.0,
                   (float(p80) + 0.5) / 1024.0,
                   matrix_valid ? metered_matrix_average : 0.5) - 0.5) * 10.0;
+    // The matrix feature is highly correlated with the histogram average.
+    // When it is unavailable, use the conditional mean instead of zero-fill;
+    // the rotation mixes all four dimensions and cannot mask one of them.
+    if (!matrix_valid) {
+        dsm_z.w = dsm_z.x + DSM_MATRIX_IMPUTATION_Z;
+    }
+    dsm_z = DSM_PRIOR_ROTATION * dsm_z;
+    dsm_mask = vec4(1.0);
     dsm_log_outlier = log(DSM_CONTAMINATION) - 0.5 * dot(dsm_mask,
         vec4(log(6.283185307179586 * DSM_OUTLIER_VARIANCE)) +
         dsm_z * dsm_z / DSM_OUTLIER_VARIANCE
@@ -1692,14 +1724,49 @@ float dsm_predictive(vec4 prec, vec4 information) {
     return largest + log(exp(normal - largest) + exp(dsm_log_outlier - largest));
 }
 
+// Predictive normal for a new shot: empirical core plus a broad component.
+// The broad component preserves the old N(0,9) tail for unusual shots; the
+// core lowers the normalization cost for typical shot changes.
+float dsm_prior_log_normal(vec4 w, out bool core) {
+    vec4 core_variance = 1.0 / DSM_PRIOR_PRECISION + DSM_SIGMA_SQUARED;
+    vec4 core_residual = w - DSM_PRIOR_INFORMATION / DSM_PRIOR_PRECISION;
+    float log_core = log(1.0 - DSM_PRIOR_BROAD_WEIGHT) - 0.5 * dot(dsm_mask,
+        log(6.283185307179586 * core_variance) +
+        core_residual * core_residual / core_variance
+    );
+    float broad_variance = 9.0 + DSM_SIGMA_SQUARED;
+    float log_broad = log(DSM_PRIOR_BROAD_WEIGHT) - 0.5 * dot(dsm_mask,
+        vec4(log(6.283185307179586 * broad_variance)) +
+        w * w / broad_variance
+    );
+    core = log_core >= log_broad;
+    float largest = max(log_core, log_broad);
+    return largest + log(exp(log_core - largest) + exp(log_broad - largest));
+}
+
+// Choose the new-shot state prior by the normal-component responsibility.
+// This is a hard assignment, not a full posterior mixture; the state stays
+// one Gaussian per hypothesis.
+void dsm_set_prior() {
+    bool core;
+    dsm_prior_normal = dsm_prior_log_normal(dsm_z, core) +
+                       log(1.0 - DSM_CONTAMINATION);
+    dsm_new_prior_precision = core
+        ? DSM_PRIOR_PRECISION : vec4(1.0 / 9.0);
+    dsm_new_prior_information = core
+        ? DSM_PRIOR_INFORMATION : vec4(0.0);
+}
+
 void dsm_candidate(uint index) {
     if (index > dsm_old_count) {
         return;
     }
     if (index == dsm_old_count) {
-        dsm_logits[index] = dsm_log_hazard + dsm_predictive(
-            vec4(DSM_PRIOR_PRECISION), vec4(0.0)
+        float largest = max(dsm_prior_normal, dsm_log_outlier);
+        float q_prior = largest + log(
+            exp(dsm_prior_normal - largest) + exp(dsm_log_outlier - largest)
         );
+        dsm_logits[index] = dsm_log_hazard + q_prior;
         dsm_ages[index] = 0.0;
         return;
     }
@@ -1798,8 +1865,11 @@ void dsm_select() {
     scene_short_probability = clamp(short_mass, 0.0, 1.0);
     scene_confirmed_probability = clamp(confirmed_mass, 0.0, 1.0);
     scene_fast_strength = smoothstep(0.20, 0.80, scene_short_probability);
-    scene_hard_cut = scene_new_probability >= DSM_CUT_PROBABILITY ||
-                     scene_confirmed_probability >= DSM_CUT_PROBABILITY ? 1u : 0u;
+    // A single-frame new-shot posterior cannot separate a cut from a
+    // one-frame flash once the prior is calibrated to shots rather than to
+    // arbitrary values. Require the second observation; the response layer
+    // already bridges the first new-scene frame.
+    scene_hard_cut = scene_confirmed_probability >= DSM_CUT_PROBABILITY ? 1u : 0u;
     dsm_accepted_age = scene_hard_cut > 0u ? 0.0 : accepted_age;
 
     float kept = 0.0;
@@ -1823,8 +1893,10 @@ void dsm_write(uint index) {
                           dsm_logits[selected] - dsm_log_kept;
     dsm_age[target] = prior ? 0.0 : dsm_ages[selected];
     for (uint d = 0u; d < 4u; d++) {
-        float prec = prior ? DSM_PRIOR_PRECISION : dsm_precision[source * 4u + d];
-        float information = prior ? 0.0 : dsm_information[source * 4u + d];
+        float prec = prior ? dsm_new_prior_precision[d]
+                           : dsm_precision[source * 4u + d];
+        float information = prior ? dsm_new_prior_information[d]
+                                  : dsm_information[source * 4u + d];
         dsm_precision[target * 4u + d] = prec + dsm_precision_step[d];
         dsm_information[target * 4u + d] = information + dsm_information_step[d];
     }
@@ -1839,6 +1911,10 @@ void hook() {
     if (dsm_operation == 0u) {
         return;
     }
+    if (tid == 0u) {
+        dsm_set_prior();
+    }
+    barrier();
     if (dsm_operation == 2u) {
         dsm_candidate(tid);
     }
