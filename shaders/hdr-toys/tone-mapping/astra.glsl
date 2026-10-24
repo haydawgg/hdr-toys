@@ -234,6 +234,8 @@
 //!VAR float exposure_temporal_variance
 //!VAR uint exposure_temporal_pts
 //!VAR uint exposure_temporal_valid
+//!VAR uint exposure_protection_pts
+//!VAR uint exposure_protection_state
 //!STORAGE
 
 //!BUFFER CURVE_TEMPORAL
@@ -2344,6 +2346,8 @@ float output_response_weight;
 bool output_scene_cut;
 float output_change_log_bayes;
 bool output_exposure_protected;
+float exposure_pre_step_ev;
+bool exposure_pre_step_valid;
 
 void prepare_output_temporal_response() {
     output_response_weight = 0.0;
@@ -2367,13 +2371,30 @@ void prepare_output_temporal_response() {
 
 float protect_auto_exposure(float filtered, float target, bool automatic) {
     output_exposure_protected = false;
-    if (!automatic || !finite_float(target)) {
+    if (!automatic || !finite_float(target) || !finite_float(PTS)) {
         return filtered;
     }
+    uint pts_bits = floatBitsToUint(PTS);
+    // A repeated PTS must consume the same decision. The pre-step state is
+    // gone after the first dispatch updated the filter, so latch the result.
+    if (exposure_protection_pts == pts_bits) {
+        output_exposure_protected = exposure_protection_state > 0u;
+        return output_exposure_protected ? clamp(target, -64.0, 64.0) : filtered;
+    }
     target = clamp(target, -64.0, 64.0);
+    // Compare the target with the exposure the filter held before this
+    // frame's WoLF update. The post-step value depends on the residual-
+    // dependent gain and on the cut direction, so it under-reports a jump
+    // whose ordinary step already closed half of the gap.
+    float residual = exposure_pre_step_valid
+        ? abs(exposure_pre_step_ev - target)
+        : abs(filtered - target);
     output_exposure_protected =
+        !output_scene_cut &&
         output_change_log_bayes >= EXPOSURE_PROTECTION_LOG_BAYES &&
-        abs(filtered - target) >= EXPOSURE_PROTECTION_TRIGGER_EV;
+        residual >= EXPOSURE_PROTECTION_TRIGGER_EV;
+    exposure_protection_pts = pts_bits;
+    exposure_protection_state = output_exposure_protected ? 1u : 0u;
     // Use the same EV as a confirmed cut, without writing the WoLF state.
     return output_exposure_protected ? target : filtered;
 }
@@ -2397,6 +2418,10 @@ float reset_auto_exposure(float target) {
     exposure_temporal_variance = 1.0;
     exposure_temporal_pts = floatBitsToUint(PTS);
     exposure_temporal_valid = 1u;
+    // A reset starts a new decision. In particular, a seek back to the
+    // same PTS must not reuse the latch from the earlier playback pass.
+    exposure_protection_pts = 0u;
+    exposure_protection_state = 0u;
     return target;
 }
 
@@ -2440,6 +2465,7 @@ float update_exposure_wolf_gain(float delta_time, float time_scale, float residu
 float stabilize_auto_exposure(float target, bool automatic) {
     // Clamp EV to the declared range; use neutral EV for a non-finite target.
     target = finite_float(target) ? clamp(target, -64.0, 64.0) : 0.0;
+    exposure_pre_step_valid = false;
     // Discard non-finite exposure history or timestamps.
     if (exposure_temporal_valid > 0u &&
         (!finite_float(exposure_temporal_ev) ||
@@ -2465,6 +2491,8 @@ float stabilize_auto_exposure(float target, bool automatic) {
 
     float delta_time = PTS - uintBitsToFloat(exposure_temporal_pts);
     if (abs(delta_time) <= EXPOSURE_PTS_EPSILON) {
+        exposure_pre_step_ev = exposure_temporal_ev;
+        exposure_pre_step_valid = true;
         return exposure_temporal_ev;
     }
 
@@ -2479,6 +2507,8 @@ float stabilize_auto_exposure(float target, bool automatic) {
     time_scale = output_temporal_time_scale(
         time_scale, OUTPUT_TEMPORAL_SCENE_TIME_SCALE
     );
+    exposure_pre_step_ev = exposure_temporal_ev;
+    exposure_pre_step_valid = true;
     float alpha = update_exposure_wolf_gain(
         delta_time, time_scale, target - exposure_temporal_ev
     );
