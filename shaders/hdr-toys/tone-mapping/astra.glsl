@@ -4585,6 +4585,7 @@ void hook() {
 //!BIND METERING
 //!BIND METERED
 //!BIND METADATA
+//!BIND SCENE_RESPONSE
 //!BIND PREVIEW_VECTORSCOPE
 //!BIND PREVIEW_HISTOGRAM
 //!BIND PREVIEW_METRICS
@@ -4616,6 +4617,10 @@ const float GAP = 6.0 * SCALE;
 const uint PREVIEW_HISTOGRAM_SIZE = 64u;
 const float PREVIEW_HISTOGRAM_BIN_WIDTH = 4.0;
 const float PREVIEW_HISTOGRAM_EXTENT = 256.0;
+
+// A confirmed shot cut marks the histogram's upper-left corner.
+const float PREVIEW_CUT_MARKER_SIZE = 4.0 * SCALE;
+const float PREVIEW_CUT_MARKER_INSET = SCALE;
 
 // Normalize density to a fixed 128x128 reference grid.
 const uint PREVIEW_VECTORSCOPE_SIZE = 96u;
@@ -4785,6 +4790,20 @@ bool preview_panel_point(
     return true;
 }
 
+// Paint the histogram's upper-left corner while the current frame is a
+// confirmed shot cut.
+bool preview_cut_marker(vec2 local) {
+    return scene_hard_cut > 0u &&
+           all(greaterThanEqual(
+               local,
+               vec2(PREVIEW_CUT_MARKER_INSET)
+           )) &&
+           all(lessThan(
+               local,
+               vec2(PREVIEW_CUT_MARKER_INSET + PREVIEW_CUT_MARKER_SIZE)
+           ));
+}
+
 vec4 draw_histogram(vec2 px) {
     vec2 origin = vec2(MARGIN * SCALE);
     vec2 local;
@@ -4832,6 +4851,10 @@ vec4 draw_histogram(vec2 px) {
 
     if (abs(level - pq_output) <= 1.5 / plot_height) {
         tint = vec3(1.0, 0.78, 0.12);
+    }
+
+    if (preview_cut_marker(local)) {
+        tint = vec3(1.0, 0.0, 0.0);
     }
 
     return vec4(tint, 1.0);
