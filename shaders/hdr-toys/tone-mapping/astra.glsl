@@ -236,6 +236,9 @@
 //!VAR uint exposure_temporal_valid
 //!VAR uint exposure_protection_pts
 //!VAR uint exposure_protection_state
+//!VAR uint exposure_protection_run
+//!VAR float exposure_previous_target
+//!VAR uint exposure_target_valid
 //!STORAGE
 
 //!BUFFER CURVE_TEMPORAL
@@ -1915,6 +1918,12 @@ const float EXPOSURE_WOLF_VARIANCE_MAX = 1e6;
 // Protect a large EV mismatch when new-scene prediction is at least 4x likelier.
 const float EXPOSURE_PROTECTION_LOG_BAYES = 1.3862943611198906;
 const float EXPOSURE_PROTECTION_TRIGGER_EV = 0.5;
+// A target step distinguishes a new shot from a filter still catching up.
+const float EXPOSURE_PROTECTION_TARGET_STEP_EV = 0.2;
+// Hold a first-frame bridge while the filter is still at least this far,
+// for at most this many consecutive frames.
+const float EXPOSURE_PROTECTION_HOLD_EV = 0.1;
+const uint EXPOSURE_PROTECTION_HOLD_FRAMES = 3u;
 
 // Scene probability selects the faster exposure and curve response scales.
 const float OUTPUT_TEMPORAL_SCENE_TIME_SCALE = 0.125;
@@ -2344,6 +2353,7 @@ float resolve_exposure(MeteringMetrics metrics) {
 // of HDR metadata selection; only current events may affect output history.
 float output_response_weight;
 bool output_scene_cut;
+bool output_scene_current;
 float output_change_log_bayes;
 bool output_exposure_protected;
 float exposure_pre_step_ev;
@@ -2352,6 +2362,7 @@ bool exposure_pre_step_valid;
 void prepare_output_temporal_response() {
     output_response_weight = 0.0;
     output_scene_cut = false;
+    output_scene_current = false;
     output_change_log_bayes = 0.0;
     output_exposure_protected = false;
     // Events stay latched for redraws; exposure/curve consume each PTS once.
@@ -2361,6 +2372,7 @@ void prepare_output_temporal_response() {
                    abs(PTS - uintBitsToFloat(scene_observation_pts)) <=
                        EXPOSURE_PTS_EPSILON;
     if (current) {
+        output_scene_current = true;
         output_scene_cut = scene_hard_cut > 0u;
         output_response_weight = finite_float(scene_fast_strength)
             ? clamp(scene_fast_strength, 0.0, 1.0) : 0.0;
@@ -2389,12 +2401,32 @@ float protect_auto_exposure(float filtered, float target, bool automatic) {
     float residual = exposure_pre_step_valid
         ? abs(exposure_pre_step_ev - target)
         : abs(filtered - target);
-    output_exposure_protected =
-        !output_scene_cut &&
-        output_change_log_bayes >= EXPOSURE_PROTECTION_LOG_BAYES &&
-        residual >= EXPOSURE_PROTECTION_TRIGGER_EV;
+    // A target that did not step is a filter still catching up, not a new
+    // shot: do not bypass WoLF merely because the lag exceeds the trigger.
+    bool target_step = exposure_target_valid == 0u ||
+                       abs(target - exposure_previous_target) >=
+                           EXPOSURE_PROTECTION_TARGET_STEP_EV;
+    bool base = !output_scene_cut &&
+                target_step &&
+                output_change_log_bayes >= EXPOSURE_PROTECTION_LOG_BAYES &&
+                residual >= EXPOSURE_PROTECTION_TRIGGER_EV;
+    // Hold a first-frame bridge while the filter is still settling. The
+    // target is re-read every frame, so a returning flash follows its own
+    // target instead of staying at the transient level. The hold never
+    // starts on its own: a target that did not step stays filtered.
+    bool hold = !output_scene_cut &&
+                output_scene_current &&
+                exposure_pre_step_valid &&
+                exposure_protection_run > 0u &&
+                exposure_protection_run < EXPOSURE_PROTECTION_HOLD_FRAMES &&
+                residual >= EXPOSURE_PROTECTION_HOLD_EV;
+    output_exposure_protected = base || hold;
+    exposure_protection_run = output_exposure_protected
+        ? exposure_protection_run + 1u : 0u;
     exposure_protection_pts = pts_bits;
     exposure_protection_state = output_exposure_protected ? 1u : 0u;
+    exposure_previous_target = target;
+    exposure_target_valid = 1u;
     // Use the same EV as a confirmed cut, without writing the WoLF state.
     return output_exposure_protected ? target : filtered;
 }
@@ -2422,6 +2454,7 @@ float reset_auto_exposure(float target) {
     // same PTS must not reuse the latch from the earlier playback pass.
     exposure_protection_pts = 0u;
     exposure_protection_state = 0u;
+    exposure_protection_run = 0u;
     return target;
 }
 
