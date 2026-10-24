@@ -238,6 +238,7 @@
 
 //!BUFFER CURVE_TEMPORAL
 //!VAR float curve_temporal_values[1024]
+//!VAR float curve_display_values[1024]
 //!VAR float curve_temporal_alpha
 //!VAR uint curve_temporal_reset
 //!VAR uint curve_temporal_bypass
@@ -3135,7 +3136,11 @@ bool finite_float(float value) {
 
 float stabilize_curve_value(int index, float target) {
     if (curve_temporal_bypass > 0u) {
-        return finite_float(target) ? target : 0.0;
+        float value = finite_float(target) ? target : 0.0;
+        // Publish the curve actually displayed without overwriting the
+        // recoverable history used after a flash or a confirmed cut.
+        curve_display_values[index] = value;
+        return value;
     }
     // Read history only when reset is inactive.
     bool history_valid = curve_temporal_reset == 0u &&
@@ -3147,6 +3152,7 @@ float stabilize_curve_value(int index, float target) {
 
     if (curve_temporal_reset > 0u || !history_valid) {
         curve_temporal_values[index] = target;
+        curve_display_values[index] = target;
         return target;
     }
 
@@ -3158,6 +3164,7 @@ float stabilize_curve_value(int index, float target) {
     // Fall back to the target if interpolation produces a non-finite value.
     value = finite_float(value) ? value : target;
     curve_temporal_values[index] = value;
+    curve_display_values[index] = value;
     return value;
 }
 
@@ -3778,15 +3785,17 @@ float sample_tone_curve_slope(float x) {
     int upper_index = lower_index + 1;
     float weight = position - float(lower_index);
 
-    // Use the full-precision, temporally stabilized source of the LUT.
-    // Differencing a half-float atlas could amplify quantization into bands.
-    float lower_value = curve_temporal_values[lower_index];
-    float upper_value = curve_temporal_values[upper_index];
+    // Use the full-precision curve actually displayed this frame. On a
+    // protected frame the LUT is generated from the target while the
+    // recoverable history stays at the previous shot, so differencing the
+    // history would weight chroma for a curve that is not displayed.
+    float lower_value = curve_display_values[lower_index];
+    float upper_value = curve_display_values[upper_index];
     float previous_value = lower_index > 0
-        ? curve_temporal_values[lower_index - 1]
+        ? curve_display_values[lower_index - 1]
         : 2.0 * lower_value - upper_value;
     float next_value = upper_index < CURVE_SIZE - 1
-        ? curve_temporal_values[upper_index + 1]
+        ? curve_display_values[upper_index + 1]
         : 2.0 * upper_value - lower_value;
 
     // Derivative of a cubic B-spline reconstruction: blend three secant
