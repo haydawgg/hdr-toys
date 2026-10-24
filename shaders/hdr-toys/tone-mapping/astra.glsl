@@ -2741,11 +2741,19 @@ void update_metering_metadata() {
     float target_ev = resolve_exposure(metrics);
     bool automatic = automatic_exposure_enabled(metrics);
     float filtered_ev = stabilize_auto_exposure(target_ev, automatic);
-    exposure_ev = protect_auto_exposure(filtered_ev, target_ev, automatic);
+    float protected_ev = protect_auto_exposure(
+        filtered_ev,
+        target_ev,
+        automatic
+    );
     prepare_curve_temporal();
     // Apply manual EV compensation after smoothing so it stays immediate and
     // does not enter automatic-exposure history. Bound the combined exposure.
-    exposure_ev = clamp(exposure_ev + exposure_value_offset, -64.0, 64.0);
+    exposure_ev = clamp(
+        protected_ev + exposure_value_offset,
+        -64.0,
+        64.0
+    );
     exposure_scale = exp2(exposure_ev);
     apply_exposure_to_range(metrics, exposure_scale);
     publish_metering_metadata(metrics);
