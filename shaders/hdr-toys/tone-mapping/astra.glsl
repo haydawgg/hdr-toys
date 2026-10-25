@@ -147,7 +147,7 @@
 0.0
 
 //!PARAM spatial_stable_level
-//!TYPE CONSTANT uint
+//!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 5
 3
@@ -478,110 +478,189 @@ vec4 hook() { return vec4(sample_metering_downscaled(), 0.0, 1.0); }
 //!WIDTH METERING.w
 //!HEIGHT METERING.h
 //!WHEN spatial_stable_level 0 >
-//!DESC metering (spatial stabilization, blur, horizontal)
+//!COMPUTE 16 16 16 16
+//!DESC metering (spatial stabilization, blur)
 
-// Separable Gaussian blur on the 512x288 metering map.
-// Sigma is 1.25^(level - 1), truncated at ceil(3 * sigma) texels.
-// Pair adjacent taps with bilinear sampling; materialize both directions
-// so the histogram, zones, and statistics consume the same filtered map.
-// Keep this scalar kernel synchronized with the vertical pass.
-// [Efficient Gaussian blur with linear sampling](https://www.rastergrid.com/blog/2010/09/efficient-gaussian-blur-with-linear-sampling/)
+// One workgroup produces a 16x16 tile, including both separable directions.
+// Clamp the source halo before filtering and keep the horizontal intermediate
+// in shared FP32 memory, avoiding a second dispatch and intermediate texture.
+// Sigma is 1.25^(level - 1), truncated at ceil(3 * sigma). The normalized
+// coefficients below are evaluated in FP64 and rounded to shader floats.
+// DEFINE specializes the array extents and removes inactive kernel branches.
+// Keep filter_horizontal and filter_vertical coefficients synchronized.
 
-const float spatial_stable_sigma_base = 1.0;
-const float spatial_stable_sigma_ratio = 1.25;
-const float spatial_stable_reach = 3.0;
-const vec2 direction = vec2(1.0, 0.0);
+#if spatial_stable_level <= 1
+const int radius = 3;
+#elif spatial_stable_level == 2
+const int radius = 4;
+#elif spatial_stable_level == 3
+const int radius = 5;
+#elif spatial_stable_level == 4
+const int radius = 6;
+#else
+const int radius = 8;
+#endif
 
-float spatial_stable_weight(float tap, float variance) {
-    return exp(-0.5 * tap * tap / variance);
+
+const int tile_width = 16 + 2 * radius;
+shared vec2 tile[tile_width * tile_width];
+shared vec2 horizontal_tile[16 * tile_width];
+
+vec2 filter_horizontal(int center) {
+    const int stride = 1;
+#if spatial_stable_level <= 1
+    vec2 sum = tile[center] * 0.39905027965245493;
+    sum += (tile[center - 1 * stride] +
+            tile[center + 1 * stride]) * 0.24203622937611435;
+    sum += (tile[center - 2 * stride] +
+            tile[center + 2 * stride]) * 0.054005582622414498;
+    sum += (tile[center - 3 * stride] +
+            tile[center + 3 * stride]) * 0.0044330481752437459;
+#elif spatial_stable_level == 2
+    vec2 sum = tile[center] * 0.31922423439085301;
+    sum += (tile[center - 1 * stride] +
+            tile[center + 1 * stride]) * 0.2318043704135041;
+    sum += (tile[center - 2 * stride] +
+            tile[center + 2 * stride]) * 0.088756244369270459;
+    sum += (tile[center - 3 * stride] +
+            tile[center + 3 * stride]) * 0.017919576688438448;
+    sum += (tile[center - 4 * stride] +
+            tile[center + 4 * stride]) * 0.0019076913333604809;
+#elif spatial_stable_level == 3
+    vec2 sum = tile[center] * 0.25541096969073107;
+    sum += (tile[center - 1 * stride] +
+            tile[center + 1 * stride]) * 0.20811147917447398;
+    sum += (tile[center - 2 * stride] +
+            tile[center + 2 * stride]) * 0.11258110482738368;
+    sum += (tile[center - 3 * stride] +
+            tile[center + 3 * stride]) * 0.040434116389630952;
+    sum += (tile[center - 4 * stride] +
+            tile[center + 4 * stride]) * 0.0096414729606384107;
+    sum += (tile[center - 5 * stride] +
+            tile[center + 5 * stride]) * 0.0015263418025074776;
+#elif spatial_stable_level == 4
+    vec2 sum = tile[center] * 0.20441532859407782;
+    sum += (tile[center - 1 * stride] +
+            tile[center + 1 * stride]) * 0.17930384925879744;
+    sum += (tile[center - 2 * stride] +
+            tile[center + 2 * stride]) * 0.12100911201124059;
+    sum += (tile[center - 3 * stride] +
+            tile[center + 3 * stride]) * 0.062834598207420683;
+    sum += (tile[center - 4 * stride] +
+            tile[center + 4 * stride]) * 0.025103363688158426;
+    sum += (tile[center - 5 * stride] +
+            tile[center + 5 * stride]) * 0.0077164456396147515;
+    sum += (tile[center - 6 * stride] +
+            tile[center + 6 * stride]) * 0.001824966897729268;
+#else
+    vec2 sum = tile[center] * 0.16348116029814891;
+    sum += (tile[center - 1 * stride] +
+            tile[center + 1 * stride]) * 0.15032681281591539;
+    sum += (tile[center - 2 * stride] +
+            tile[center + 2 * stride]) * 0.11688066256203568;
+    sum += (tile[center - 3 * stride] +
+            tile[center + 3 * stride]) * 0.076839823134770308;
+    sum += (tile[center - 4 * stride] +
+            tile[center + 4 * stride]) * 0.042713732645968346;
+    sum += (tile[center - 5 * stride] +
+            tile[center + 5 * stride]) * 0.020076415263730153;
+    sum += (tile[center - 6 * stride] +
+            tile[center + 6 * stride]) * 0.0079788865860050892;
+    sum += (tile[center - 7 * stride] +
+            tile[center + 7 * stride]) * 0.0026812412389485853;
+    sum += (tile[center - 8 * stride] +
+            tile[center + 8 * stride]) * 0.00076184560355203445;
+#endif
+    return sum;
 }
 
-vec4 hook() {
-    // WHEN excludes level 0.
-    float sigma = spatial_stable_sigma_base * pow(
-        spatial_stable_sigma_ratio,
-        float(spatial_stable_level) - 1.0
-    );
-    float variance = sigma * sigma;
-    float last_tap = ceil(spatial_stable_reach * sigma);
+vec2 filter_vertical(int center) {
+    const int stride = 16;
+#if spatial_stable_level <= 1
+    vec2 sum = horizontal_tile[center] * 0.39905027965245493;
+    sum += (horizontal_tile[center - 1 * stride] +
+            horizontal_tile[center + 1 * stride]) * 0.24203622937611435;
+    sum += (horizontal_tile[center - 2 * stride] +
+            horizontal_tile[center + 2 * stride]) * 0.054005582622414498;
+    sum += (horizontal_tile[center - 3 * stride] +
+            horizontal_tile[center + 3 * stride]) * 0.0044330481752437459;
+#elif spatial_stable_level == 2
+    vec2 sum = horizontal_tile[center] * 0.31922423439085301;
+    sum += (horizontal_tile[center - 1 * stride] +
+            horizontal_tile[center + 1 * stride]) * 0.2318043704135041;
+    sum += (horizontal_tile[center - 2 * stride] +
+            horizontal_tile[center + 2 * stride]) * 0.088756244369270459;
+    sum += (horizontal_tile[center - 3 * stride] +
+            horizontal_tile[center + 3 * stride]) * 0.017919576688438448;
+    sum += (horizontal_tile[center - 4 * stride] +
+            horizontal_tile[center + 4 * stride]) * 0.0019076913333604809;
+#elif spatial_stable_level == 3
+    vec2 sum = horizontal_tile[center] * 0.25541096969073107;
+    sum += (horizontal_tile[center - 1 * stride] +
+            horizontal_tile[center + 1 * stride]) * 0.20811147917447398;
+    sum += (horizontal_tile[center - 2 * stride] +
+            horizontal_tile[center + 2 * stride]) * 0.11258110482738368;
+    sum += (horizontal_tile[center - 3 * stride] +
+            horizontal_tile[center + 3 * stride]) * 0.040434116389630952;
+    sum += (horizontal_tile[center - 4 * stride] +
+            horizontal_tile[center + 4 * stride]) * 0.0096414729606384107;
+    sum += (horizontal_tile[center - 5 * stride] +
+            horizontal_tile[center + 5 * stride]) * 0.0015263418025074776;
+#elif spatial_stable_level == 4
+    vec2 sum = horizontal_tile[center] * 0.20441532859407782;
+    sum += (horizontal_tile[center - 1 * stride] +
+            horizontal_tile[center + 1 * stride]) * 0.17930384925879744;
+    sum += (horizontal_tile[center - 2 * stride] +
+            horizontal_tile[center + 2 * stride]) * 0.12100911201124059;
+    sum += (horizontal_tile[center - 3 * stride] +
+            horizontal_tile[center + 3 * stride]) * 0.062834598207420683;
+    sum += (horizontal_tile[center - 4 * stride] +
+            horizontal_tile[center + 4 * stride]) * 0.025103363688158426;
+    sum += (horizontal_tile[center - 5 * stride] +
+            horizontal_tile[center + 5 * stride]) * 0.0077164456396147515;
+    sum += (horizontal_tile[center - 6 * stride] +
+            horizontal_tile[center + 6 * stride]) * 0.001824966897729268;
+#else
+    vec2 sum = horizontal_tile[center] * 0.16348116029814891;
+    sum += (horizontal_tile[center - 1 * stride] +
+            horizontal_tile[center + 1 * stride]) * 0.15032681281591539;
+    sum += (horizontal_tile[center - 2 * stride] +
+            horizontal_tile[center + 2 * stride]) * 0.11688066256203568;
+    sum += (horizontal_tile[center - 3 * stride] +
+            horizontal_tile[center + 3 * stride]) * 0.076839823134770308;
+    sum += (horizontal_tile[center - 4 * stride] +
+            horizontal_tile[center + 4 * stride]) * 0.042713732645968346;
+    sum += (horizontal_tile[center - 5 * stride] +
+            horizontal_tile[center + 5 * stride]) * 0.020076415263730153;
+    sum += (horizontal_tile[center - 6 * stride] +
+            horizontal_tile[center + 6 * stride]) * 0.0079788865860050892;
+    sum += (horizontal_tile[center - 7 * stride] +
+            horizontal_tile[center + 7 * stride]) * 0.0026812412389485853;
+    sum += (horizontal_tile[center - 8 * stride] +
+            horizontal_tile[center + 8 * stride]) * 0.00076184560355203445;
+#endif
+    return sum;
+}
 
-    // Combine adjacent taps at their weighted centroid.
-    vec2 sum = METERING_tex(METERING_pos).xy;
-    float weight_sum = 1.0;
-    for (uint pair = 1u; 2.0 * float(pair) <= last_tap + 1.0; pair++) {
-        float near_tap = 2.0 * float(pair) - 1.0;
-        float far_tap = near_tap + 1.0;
-        float near_weight = spatial_stable_weight(near_tap, variance);
-        float far_weight = far_tap <= last_tap
-            ? spatial_stable_weight(far_tap, variance)
-            : 0.0;
-
-        float pair_weight = near_weight + far_weight;
-        float pair_offset =
-            (near_tap * near_weight + far_tap * far_weight) / pair_weight;
-
-        sum += METERING_texOff( direction * pair_offset).xy * pair_weight;
-        sum += METERING_texOff(-direction * pair_offset).xy * pair_weight;
-        weight_sum += 2.0 * pair_weight;
+void hook() {
+    uint tid = gl_LocalInvocationIndex;
+    ivec2 origin = ivec2(gl_WorkGroupID.xy) * 16 - ivec2(radius);
+    for (uint i = tid; i < uint(tile_width * tile_width); i += 256u) {
+        ivec2 p = origin + ivec2(int(i) % tile_width, int(i) / tile_width);
+        p = clamp(p, ivec2(0), ivec2(METERING_size) - 1);
+        tile[i] = METERING_mul * texelFetch(METERING_raw, p, 0).xy;
     }
-
-    // Normalize to preserve constant inputs. Clamped sampling and positive
-    // weights keep the result within the input range.
-    return vec4(sum / weight_sum, 0.0, 1.0);
-}
-
-//!HOOK OUTPUT
-//!BIND METERING
-//!SAVE METERING
-//!COMPONENTS 2
-//!WIDTH METERING.w
-//!HEIGHT METERING.h
-//!WHEN spatial_stable_level 0 >
-//!DESC metering (spatial stabilization, blur, vertical)
-
-// Apply the horizontal pass's scalar kernel along the vertical axis.
-
-const float spatial_stable_sigma_base = 1.0;
-const float spatial_stable_sigma_ratio = 1.25;
-const float spatial_stable_reach = 3.0;
-const vec2 direction = vec2(0.0, 1.0);
-
-float spatial_stable_weight(float tap, float variance) {
-    return exp(-0.5 * tap * tap / variance);
-}
-
-vec4 hook() {
-    // WHEN excludes level 0.
-    float sigma = spatial_stable_sigma_base * pow(
-        spatial_stable_sigma_ratio,
-        float(spatial_stable_level) - 1.0
-    );
-    float variance = sigma * sigma;
-    float last_tap = ceil(spatial_stable_reach * sigma);
-
-    // Combine adjacent taps at their weighted centroid.
-    vec2 sum = METERING_tex(METERING_pos).xy;
-    float weight_sum = 1.0;
-    for (uint pair = 1u; 2.0 * float(pair) <= last_tap + 1.0; pair++) {
-        float near_tap = 2.0 * float(pair) - 1.0;
-        float far_tap = near_tap + 1.0;
-        float near_weight = spatial_stable_weight(near_tap, variance);
-        float far_weight = far_tap <= last_tap
-            ? spatial_stable_weight(far_tap, variance)
-            : 0.0;
-
-        float pair_weight = near_weight + far_weight;
-        float pair_offset =
-            (near_tap * near_weight + far_tap * far_weight) / pair_weight;
-
-        sum += METERING_texOff( direction * pair_offset).xy * pair_weight;
-        sum += METERING_texOff(-direction * pair_offset).xy * pair_weight;
-        weight_sum += 2.0 * pair_weight;
+    barrier();
+    for (uint i = tid; i < uint(16 * tile_width); i += 256u) {
+        int center = (int(i) / 16) * tile_width + int(i) % 16 + radius;
+        horizontal_tile[i] = filter_horizontal(center);
     }
-
-    // Normalize to preserve constant inputs. Clamped sampling and positive
-    // weights keep the result within the input range.
-    return vec4(sum / weight_sum, 0.0, 1.0);
+    barrier();
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, ivec2(METERING_size)))) return;
+    ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    int center = (local.y + radius) * 16 + local.x;
+    imageStore(out_image, p, vec4(filter_vertical(center), 0.0, 1.0));
 }
 
 //!HOOK OUTPUT
