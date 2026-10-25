@@ -267,10 +267,6 @@
 //!VAR float output_reverse_max_jhk
 //!STORAGE
 
-//!BUFFER PREVIEW_VECTORSCOPE
-//!VAR uint preview_vectorscope_bins[36864]
-//!STORAGE
-
 //!BUFFER PREVIEW_METRICS
 //!VAR uint preview_metrics_count
 //!VAR float preview_metrics_max_width
@@ -281,6 +277,10 @@
 //!BUFFER PREVIEW_HISTOGRAM
 //!VAR float preview_histogram_current[64]
 //!VAR float preview_histogram_curve[256]
+//!STORAGE
+
+//!BUFFER PREVIEW_VECTORSCOPE
+//!VAR uint preview_vectorscope_bins[36864]
 //!STORAGE
 
 //!HOOK OUTPUT
