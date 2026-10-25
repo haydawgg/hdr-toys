@@ -147,7 +147,7 @@
 0.0
 
 //!PARAM spatial_stable_level
-//!TYPE uint
+//!TYPE CONSTANT uint
 //!MINIMUM 0
 //!MAXIMUM 5
 3
