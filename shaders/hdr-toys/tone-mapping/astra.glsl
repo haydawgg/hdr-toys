@@ -694,7 +694,7 @@ void hook() {
 //!WIDTH METERING.w
 //!HEIGHT METERING.h
 //!COMPUTE 32 32 16 16
-//!DESC metering (histogram)
+//!DESC metering (histogram and matrix zones)
 
 shared uint shistogram[1024];
 shared uint smax_rgb;
@@ -781,36 +781,11 @@ void merge_workgroup_histogram(uint tid) {
     }
 }
 
-void hook() {
-    ivec2 block_base = ivec2(gl_WorkGroupID.xy) * 32;
-    ivec2 position = block_base + ivec2(gl_LocalInvocationID.xy) * 2;
-    vec4 intensities;
-    vec4 maxima;
-    fetch_metering_quad(position, intensities, maxima);
-    uint tid = gl_LocalInvocationIndex;
 
-    clear_workgroup_histogram(tid);
-    barrier();
-
-    accumulate_workgroup_metering(intensities, maxima);
-    barrier();
-
-    merge_workgroup_histogram(tid);
-}
-
-//!HOOK OUTPUT
-//!BIND METERING
-//!BIND METERED
-//!SAVE EMPTY
-//!WIDTH 256
-//!HEIGHT 144
-//!COMPUTE 16 16 16 16
-//!WHEN auto_exposure_anchor 0 > preview_metering + enable_metering 1 > *
-//!DESC metering (matrix zones)
-
-// METERING must exist. Run zones at metering level 2 when automatic
-// exposure has a positive anchor or the preview is enabled.
-// DSM uses the available zones and imputes its matrix feature when absent.
+// Each 32x32 source tile also supplies one 16x16 matrix zone. Keep the
+// filtered zone sample: averaging the histogram's FP32 texelFetch results
+// differs from hardware FP16 filtering near histogram thresholds.
+// The uniform gate below preserves the former matrix pass's scheduling.
 
 // A 256x144 analysis grid maps exactly to 16x9 workgroups. Each workgroup
 // builds a compact histogram for one image zone, then publishes a robust mean
@@ -847,11 +822,6 @@ shared uint zone_prefix[2][MATRIX_ZONE_HISTOGRAM_SIZE];
 shared uint zone_retained_count[MATRIX_ZONE_HISTOGRAM_SIZE];
 shared uint zone_low_bin;
 shared uint zone_high_bin;
-
-// Ordered-comparison sanitizer; see the metering intensity pass.
-float sanitize_bounded(float value, float lower_bound, float upper_bound) {
-    return value > lower_bound ? min(value, upper_bound) : lower_bound;
-}
 
 uint matrix_zone_value_code(float value) {
     // Reject NaN before the float-to-uint conversion per the file-wide
@@ -992,30 +962,44 @@ void publish_matrix_zone(uint tid, uint zone_index) {
     }
 }
 
-void analyze_matrix_zone() {
+void hook() {
     uint tid = gl_LocalInvocationIndex;
-    vec2 position = (vec2(gl_GlobalInvocationID.xy) + 0.5) /
-                    MATRIX_METERING_SIZE;
+    ivec2 position = ivec2(gl_WorkGroupID.xy) * 32 +
+                     ivec2(gl_LocalInvocationID.xy) * 2;
+    vec4 intensities;
+    vec4 maxima;
+    fetch_metering_quad(position, intensities, maxima);
+    bool matrix_enabled = enable_metering > 1u &&
+                          (auto_exposure_anchor > 0.0 || preview_metering > 0u);
 
-    clear_zone_histogram(tid);
+    clear_workgroup_histogram(tid);
+    if (matrix_enabled) {
+        clear_zone_histogram(tid);
+    }
     barrier();
 
-    float value = sample_matrix_metering(position);
-    uint value_code = matrix_zone_value_code(value);
-    atomicAdd(
-        zone_histogram[matrix_zone_histogram_bin(value_code)],
-        matrix_zone_packed_sample(value_code)
-    );
+    accumulate_workgroup_metering(intensities, maxima);
+    if (matrix_enabled) {
+        vec2 zone_position = (vec2(gl_GlobalInvocationID.xy) + 0.5) /
+                             MATRIX_METERING_SIZE;
+        float value = sample_matrix_metering(zone_position);
+        uint value_code = matrix_zone_value_code(value);
+        atomicAdd(
+            zone_histogram[matrix_zone_histogram_bin(value_code)],
+            matrix_zone_packed_sample(value_code)
+        );
+    }
     barrier();
 
-    uint zone_index = gl_WorkGroupID.y * MATRIX_ZONE_COLUMNS +
-                      gl_WorkGroupID.x;
-    if (zone_index < MATRIX_ZONE_COUNT) {
+    merge_workgroup_histogram(tid);
+    // This condition depends only on uniform parameters, so every invocation
+    // in the workgroup participates in the zone scan's barriers together.
+    if (matrix_enabled) {
+        uint zone_index = gl_WorkGroupID.y * MATRIX_ZONE_COLUMNS +
+                          gl_WorkGroupID.x;
         publish_matrix_zone(tid, zone_index);
     }
 }
-
-void hook() { analyze_matrix_zone(); }
 
 //!HOOK OUTPUT
 //!BIND METERING
