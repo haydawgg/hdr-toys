@@ -3949,12 +3949,9 @@ vec3 LAB_to_RGB(vec3 lab) {
 float sample_tone_curve_lut(float x) {
     float position = sanitize_bounded(x, 0.0, 1.0) *
                      float(CURVE_SIZE - 1);
-    int lower_index = int(floor(position));
-    int upper_index = min(lower_index + 1, CURVE_SIZE - 1);
-    float weight = fract(position);
-    float lower_value = fetch_atlas_raw(ivec2(lower_index, CURVE_ROW)).x;
-    float upper_value = fetch_atlas_raw(ivec2(upper_index, CURVE_ROW)).x;
-    return LUTS_mul * mix(lower_value, upper_value, weight);
+    // Stay on the curve row's texel centers; the sampler interpolates only X.
+    vec2 coordinates = (vec2(position, float(CURVE_ROW)) + 0.5) / LUTS_size;
+    return LUTS_mul * textureLod(LUTS_raw, coordinates, 0.0).x;
 }
 
 float sample_tone_curve_slope(float x) {
@@ -4044,16 +4041,10 @@ float sample_chroma_boundary(vec2 ab, float lightness) {
     float hue = fract(atan(ab.y, ab.x) / 6.283185307179586 + 1.0);
     ivec2 last_texel = ivec2(BOUNDARY_HUE_INTERVALS, BOUNDARY_LIGHTNESS_INTERVALS);
     vec2 position = vec2(hue, encode_output_lightness(lightness)) * vec2(last_texel);
-    ivec2 lower = ivec2(floor(position));
-    ivec2 upper = min(lower + ivec2(1), last_texel);
-    vec2 weight = fract(position);
-    float r00 = texelFetch(CHROMA_BOUNDARY_raw, lower, 0).x;
-    float r10 = texelFetch(CHROMA_BOUNDARY_raw, ivec2(upper.x, lower.y), 0).x;
-    float r01 = texelFetch(CHROMA_BOUNDARY_raw, ivec2(lower.x, upper.y), 0).x;
-    float r11 = texelFetch(CHROMA_BOUNDARY_raw, upper, 0).x;
-    float ratio = CHROMA_BOUNDARY_mul * mix(
-        mix(r00, r10, weight.x), mix(r01, r11, weight.x), weight.y
-    );
+    // The duplicated hue-zero column preserves interpolation across the seam.
+    vec2 coordinates = (position + 0.5) / CHROMA_BOUNDARY_size;
+    float ratio = CHROMA_BOUNDARY_mul *
+                  textureLod(CHROMA_BOUNDARY_raw, coordinates, 0.0).x;
     // Match LAB_to_lut_coordinates even if the Jhk lookup clamps at an end.
     return max(ratio, 0.0) * max(lightness, 1e-6);
 }
