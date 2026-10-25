@@ -2463,25 +2463,24 @@ void prepare_output_temporal_response() {
         dsm_valid = 0u;
         dsm_clear_response();
     }
-    if (!temporal || !measured) {
-        // Source changes may redraw the same PTS; discard its latched bridge.
+    bool current = temporal && measured && temporal_stable_scene_change > 0u &&
+                   scene_observation_valid > 0u && finite_float(PTS) &&
+                   abs(PTS - uintBitsToFloat(scene_observation_pts)) <=
+                       EXPOSURE_PTS_EPSILON;
+    if (!current) {
+        // Policy/source changes may redraw the same PTS. Release the bridge
+        // before protect_auto_exposure() can reuse that frame's decision.
         exposure_protection_state = 0u;
         exposure_protection_run = 0u;
         return;
     }
     // Events stay latched for redraws; exposure/curve consume each PTS once.
-    bool current = temporal_stable_scene_change > 0u &&
-                   scene_observation_valid > 0u && finite_float(PTS) &&
-                   abs(PTS - uintBitsToFloat(scene_observation_pts)) <=
-                       EXPOSURE_PTS_EPSILON;
-    if (current) {
-        output_scene_current = true;
-        output_scene_cut = scene_hard_cut > 0u;
-        output_response_weight = finite_float(scene_fast_strength)
-            ? clamp(scene_fast_strength, 0.0, 1.0) : 0.0;
-        output_change_log_bayes = finite_float(scene_change_log_bayes)
-            ? scene_change_log_bayes : 0.0;
-    }
+    output_scene_current = true;
+    output_scene_cut = scene_hard_cut > 0u;
+    output_response_weight = finite_float(scene_fast_strength)
+        ? clamp(scene_fast_strength, 0.0, 1.0) : 0.0;
+    output_change_log_bayes = finite_float(scene_change_log_bayes)
+        ? scene_change_log_bayes : 0.0;
 }
 
 float protect_auto_exposure(float filtered, float target, bool automatic) {
