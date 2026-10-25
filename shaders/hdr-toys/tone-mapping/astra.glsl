@@ -1838,14 +1838,12 @@ void dsm_select() {
     scene_change_log_bayes = dsm_logits[dsm_old_count] - dsm_log_hazard -
                              log_old_predictive;
 
-    float largest = dsm_logits[0];
-    for (uint i = 1u; i <= dsm_old_count; i++) {
-        largest = max(largest, dsm_logits[i]);
-    }
-    float total = 0.0;
-    for (uint i = 0u; i <= dsm_old_count; i++) {
-        total += exp(dsm_logits[i] - largest);
-    }
+    // The old candidates were already reduced for predictive evidence.
+    // Rescale that sum and add the new hypothesis instead of reducing again.
+    float new_logit = dsm_logits[dsm_old_count];
+    float largest = max(old_largest, new_logit);
+    float total = old_total * exp(old_largest - largest) +
+                  exp(new_logit - largest);
     float log_total = largest + log(total);
     float accepted_age = dsm_accepted_age + dsm_dt;
     float short_mass = 0.0;
