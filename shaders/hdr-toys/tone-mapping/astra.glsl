@@ -235,6 +235,7 @@
 //!VAR uint exposure_temporal_pts
 //!VAR uint exposure_temporal_valid
 //!VAR uint exposure_protection_pts
+//!VAR uint exposure_protection_valid
 //!VAR uint exposure_protection_state
 //!VAR uint exposure_protection_run
 //!VAR float exposure_previous_target
@@ -2451,6 +2452,12 @@ void dsm_clear_response() {
     scene_observation_pts = floatBitsToUint(PTS);
 }
 
+void invalidate_exposure_protection() {
+    exposure_protection_valid = 0u;
+    exposure_protection_state = 0u;
+    exposure_protection_run = 0u;
+}
+
 void prepare_output_temporal_response() {
     output_response_weight = 0.0;
     output_scene_cut = false;
@@ -2470,8 +2477,7 @@ void prepare_output_temporal_response() {
     if (!current) {
         // Policy/source changes may redraw the same PTS. Release the bridge
         // before protect_auto_exposure() can reuse that frame's decision.
-        exposure_protection_state = 0u;
-        exposure_protection_run = 0u;
+        invalidate_exposure_protection();
         return;
     }
     // Events stay latched for redraws; exposure/curve consume each PTS once.
@@ -2486,12 +2492,13 @@ void prepare_output_temporal_response() {
 float protect_auto_exposure(float filtered, float target, bool automatic) {
     output_exposure_protected = false;
     if (!automatic || !finite_float(target) || !finite_float(PTS)) {
+        invalidate_exposure_protection();
         return filtered;
     }
     uint pts_bits = floatBitsToUint(PTS);
     // A repeated PTS must consume the same decision. The pre-step state is
     // gone after the first dispatch updated the filter, so latch the result.
-    if (exposure_protection_pts == pts_bits) {
+    if (exposure_protection_valid > 0u && exposure_protection_pts == pts_bits) {
         output_exposure_protected = exposure_protection_state > 0u;
         return output_exposure_protected ? clamp(target, -64.0, 64.0) : filtered;
     }
@@ -2526,6 +2533,7 @@ float protect_auto_exposure(float filtered, float target, bool automatic) {
     exposure_protection_run = output_exposure_protected
         ? exposure_protection_run + 1u : 0u;
     exposure_protection_pts = pts_bits;
+    exposure_protection_valid = 1u;
     exposure_protection_state = output_exposure_protected ? 1u : 0u;
     exposure_previous_target = target;
     exposure_target_valid = 1u;
@@ -2552,11 +2560,11 @@ float reset_auto_exposure(float target) {
     exposure_temporal_variance = 1.0;
     exposure_temporal_pts = floatBitsToUint(PTS);
     exposure_temporal_valid = 1u;
-    // A reset starts a new decision. In particular, a seek back to the
-    // same PTS must not reuse the latch from the earlier playback pass.
-    exposure_protection_pts = 0u;
-    exposure_protection_state = 0u;
-    exposure_protection_run = 0u;
+    // Zero is a valid PTS. Track latch validity independently so every reset
+    // starts a new decision, including a seek back to the beginning.
+    invalidate_exposure_protection();
+    exposure_previous_target = target;
+    exposure_target_valid = 1u;
     return target;
 }
 
