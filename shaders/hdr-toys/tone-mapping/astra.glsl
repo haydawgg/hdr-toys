@@ -591,7 +591,7 @@ vec4 hook() {
 //!WIDTH 1024
 //!HEIGHT 1
 //!COMPUTE 256 1 256 1
-//!DESC metering (histogram, init)
+//!DESC metering (initialize)
 
 void clear_metering_histogram_bin(uint index) {
     if (index < 1024u) {
