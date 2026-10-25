@@ -286,11 +286,11 @@
 //!BIND HOOKED
 //!SAVE METERING
 //!COMPONENTS 2
-//!WHEN enable_metering 0 > max_pq_y 0 > ! scene_max_r 0 > scene_max_g 0 > + scene_max_b 0 > + ! * force_metering + * preview_metering + temporal_stable_duration 0 > enable_metering 0 > * +
+//!WHEN enable_metering 0 > max_pq_y 0 > ! scene_max_r 0 > scene_max_g 0 > + scene_max_b 0 > + ! * force_metering + * preview_metering +
 //!DESC metering (intensity map)
 
 // Keep the peak-metadata test aligned with resolve_metering_metrics().
-// Preview and DSM also run metering without changing exposure's data source.
+// Preview runs the metering chain without selecting its results for normal output.
 // BIND METERING gates consumers on the availability of the current map.
 // WHEN is evaluated before BIND; do not query a conditionally absent texture.
 // Keep the shader directive marker (two slashes followed by an exclamation
@@ -725,13 +725,12 @@ void hook() {
 //!WIDTH 256
 //!HEIGHT 144
 //!COMPUTE 16 16 16 16
-//!WHEN auto_exposure_anchor 0 > preview_metering + enable_metering 1 > * temporal_stable_duration 0 > enable_metering 0 > * +
+//!WHEN auto_exposure_anchor 0 > preview_metering + enable_metering 1 > *
 //!DESC metering (matrix zones)
 
 // METERING must exist. Run zones at metering level 2 when automatic
 // exposure has a positive anchor or the preview is enabled.
-// DSM also requests zones at either enabled metering level, independently
-// of the exposure anchor and the presence of dynamic HDR metadata.
+// DSM uses the available zones and imputes its matrix feature when absent.
 
 // A 256x144 analysis grid maps exactly to 16x9 workgroups. Each workgroup
 // builds a compact histogram for one image zone, then publishes a robust mean
@@ -1563,6 +1562,7 @@ void reduce_metering_statistics() {
 void hook() { reduce_metering_statistics(); }
 
 //!HOOK OUTPUT
+//!BIND METERING
 //!BIND METERED
 //!BIND SCENE_DSM
 //!BIND SCENE_RESPONSE
@@ -1570,6 +1570,7 @@ void hook() { reduce_metering_statistics(); }
 //!WIDTH 64
 //!HEIGHT 1
 //!COMPUTE 64 1 64 1
+//!WHEN temporal_stable_duration 0 >
 //!DESC metering (scene adaptation)
 
 // Before-observation changepoints, diagonal known-variance Gaussian DSM.
@@ -1649,8 +1650,7 @@ void dsm_clear_response() {
 void dsm_prepare() {
     dsm_operation = 0u;
     dsm_bad_history = 0u;
-    if (temporal_stable_duration <= 0.0 ||
-        enable_metering == 0u || !dsm_finite(PTS)) {
+    if (!dsm_finite(PTS)) {
         dsm_valid = 0u;
         dsm_clear_response();
         return;
@@ -1661,8 +1661,8 @@ void dsm_prepare() {
     }
     dsm_clear_response();
 
-    // This pass runs even when disabled to invalidate dormant history. The
-    // intensity-map gate guarantees fresh measurements when DSM is enabled.
+    // BIND supplies current measurements, including those requested by preview.
+    // Metadata invalidates dormant history whenever this pass is disabled.
     if (metered_histogram_count == 0u || !dsm_finite(metered_histogram_average) ||
         metered_histogram_average < 0.0 || metered_histogram_average > 1.0) {
         return;
@@ -1952,6 +1952,7 @@ void hook() {
 
 //!HOOK OUTPUT
 //!BIND METERED
+//!BIND SCENE_DSM
 //!BIND SCENE_RESPONSE
 //!BIND EXPOSURE_TEMPORAL
 //!BIND CURVE_TEMPORAL
@@ -2425,8 +2426,8 @@ float resolve_exposure(MeteringMetrics metrics) {
     return calculate_auto_exposure(metrics);
 }
 
-// Resolve once per metadata pass. Source scene statistics remain independent
-// of HDR metadata selection; only current events may affect output history.
+// Resolve once per metadata pass. Preview may maintain scene diagnostics;
+// only selected measurements may drive normal output.
 float output_response_weight;
 bool output_scene_cut;
 bool output_scene_current;
@@ -2435,15 +2436,41 @@ bool output_exposure_protected;
 float exposure_pre_step_ev;
 bool exposure_pre_step_valid;
 
+void dsm_clear_response() {
+    scene_new_probability = 0.0;
+    scene_short_probability = 0.0;
+    scene_confirmed_probability = 0.0;
+    scene_fast_strength = 0.0;
+    scene_discarded_mass = 0.0;
+    scene_outlier_probability = 0.0;
+    scene_change_log_bayes = 0.0;
+    scene_hard_cut = 0u;
+    scene_bootstrap = 0u;
+    scene_observation_valid = 0u;
+    scene_state_recovered = 0u;
+    scene_observation_pts = floatBitsToUint(PTS);
+}
+
 void prepare_output_temporal_response() {
     output_response_weight = 0.0;
     output_scene_cut = false;
     output_scene_current = false;
     output_change_log_bayes = 0.0;
     output_exposure_protected = false;
+    bool temporal = temporal_stable_duration > 0.0;
+    bool measured = measured_metering_enabled();
+    if (!temporal || (!measured && preview_metering == 0u)) {
+        dsm_valid = 0u;
+        dsm_clear_response();
+    }
+    if (!temporal || !measured) {
+        // Source changes may redraw the same PTS; discard its latched bridge.
+        exposure_protection_state = 0u;
+        exposure_protection_run = 0u;
+        return;
+    }
     // Events stay latched for redraws; exposure/curve consume each PTS once.
-    bool current = temporal_stable_duration > 0.0 && enable_metering > 0u &&
-                   temporal_stable_scene_change > 0u &&
+    bool current = temporal_stable_scene_change > 0u &&
                    scene_observation_valid > 0u && finite_float(PTS) &&
                    abs(PTS - uintBitsToFloat(scene_observation_pts)) <=
                        EXPOSURE_PTS_EPSILON;
