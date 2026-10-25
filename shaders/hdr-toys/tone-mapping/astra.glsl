@@ -1585,6 +1585,9 @@ void hook() { reduce_metering_statistics(); }
 // as content-independent.
 const uint DSM_CAPACITY = 32u;
 const float DSM_SIGMA_SQUARED = 0.0625;
+// Diffusion scale in the rotated observation coordinates; independent of
+// the broad prior variance even though their current values coincide.
+const float DSM_DIFFUSION_SCALE_SQUARED = 9.0;
 const vec4 DSM_PRIOR_PRECISION = vec4(
     20.0, 20.0, 12.07577751, 0.28347464
 );
@@ -1601,6 +1604,7 @@ const float DSM_MATRIX_IMPUTATION_Z = 0.02433227;
 // A broad N(0,9) component keeps cuts to unusual shots detectable; the
 // empirical core alone would saturate both hypotheses at the outlier floor.
 const float DSM_PRIOR_BROAD_WEIGHT = 0.1;
+const float DSM_PRIOR_BROAD_VARIANCE = 9.0;
 const float DSM_OUTLIER_VARIANCE = 64.0;
 const float DSM_CONTAMINATION = 0.02;
 const float DSM_SHOT_SECONDS = 5.0;
@@ -1610,12 +1614,11 @@ const float DSM_PTS_EPSILON = 1e-6;
 const float DSM_CUT_PROBABILITY = 0.95;
 
 shared vec4 dsm_z;
-shared vec4 dsm_mask;
 shared vec4 dsm_precision_step;
 shared vec4 dsm_information_step;
-shared float dsm_logits[33];
-shared float dsm_ages[33];
-shared uint dsm_selected[32];
+shared float dsm_logits[DSM_CAPACITY + 1u];
+shared float dsm_ages[DSM_CAPACITY + 1u];
+shared uint dsm_selected[DSM_CAPACITY];
 shared uint dsm_operation;
 shared uint dsm_old_count;
 shared uint dsm_next_count;
@@ -1631,6 +1634,11 @@ shared vec4 dsm_new_prior_information;
 
 bool dsm_finite(float x) {
     return !isnan(x) && !isinf(x);
+}
+
+float dsm_log_add_exp(float a, float b) {
+    float largest = max(a, b);
+    return largest + log(exp(a - largest) + exp(b - largest));
 }
 
 void dsm_clear_response() {
@@ -1685,18 +1693,15 @@ void dsm_prepare() {
         dsm_z.w = dsm_z.x + DSM_MATRIX_IMPUTATION_Z;
     }
     dsm_z = DSM_PRIOR_ROTATION * dsm_z;
-    dsm_mask = vec4(1.0);
-    dsm_log_outlier = log(DSM_CONTAMINATION) - 0.5 * dot(dsm_mask,
+    dsm_log_outlier = log(DSM_CONTAMINATION) - 0.5 * dot(vec4(1.0),
         vec4(log(6.283185307179586 * DSM_OUTLIER_VARIANCE)) +
         dsm_z * dsm_z / DSM_OUTLIER_VARIANCE
     );
-    vec4 a = 1.0 / (1.0 + dsm_z * dsm_z / 9.0);
-    vec4 derivative = -2.0 * dsm_z * a * a / 9.0;
+    vec4 a = 1.0 / (1.0 + dsm_z * dsm_z / DSM_DIFFUSION_SCALE_SQUARED);
+    vec4 derivative = -2.0 * dsm_z * a * a / DSM_DIFFUSION_SCALE_SQUARED;
     // omega=sigma²/2: prec += a/sigma², information += a*z/sigma²-a'.
-    dsm_precision_step = dsm_mask * a / DSM_SIGMA_SQUARED;
-    dsm_information_step = dsm_mask * (
-        a * dsm_z / DSM_SIGMA_SQUARED - derivative
-    );
+    dsm_precision_step = a / DSM_SIGMA_SQUARED;
+    dsm_information_step = a * dsm_z / DSM_SIGMA_SQUARED - derivative;
     dsm_dt = PTS - uintBitsToFloat(dsm_last_pts);
     bool corrupt = dsm_valid > 0u && (dsm_count == 0u ||
                    dsm_count > DSM_CAPACITY || dsm_bank > 1u ||
@@ -1718,11 +1723,10 @@ void dsm_prepare() {
 float dsm_predictive(vec4 prec, vec4 information) {
     vec4 variance = DSM_SIGMA_SQUARED + 1.0 / prec;
     vec4 residual = dsm_z - information / prec;
-    float normal = -0.5 * dot(dsm_mask,
+    float normal = -0.5 * dot(vec4(1.0),
         log(6.283185307179586 * variance) + residual * residual / variance
     ) + log(1.0 - DSM_CONTAMINATION);
-    float largest = max(normal, dsm_log_outlier);
-    return largest + log(exp(normal - largest) + exp(dsm_log_outlier - largest));
+    return dsm_log_add_exp(normal, dsm_log_outlier);
 }
 
 // Predictive normal for a new shot: empirical core plus a broad component.
@@ -1731,18 +1735,17 @@ float dsm_predictive(vec4 prec, vec4 information) {
 float dsm_prior_log_normal(vec4 w, out bool core) {
     vec4 core_variance = 1.0 / DSM_PRIOR_PRECISION + DSM_SIGMA_SQUARED;
     vec4 core_residual = w - DSM_PRIOR_INFORMATION / DSM_PRIOR_PRECISION;
-    float log_core = log(1.0 - DSM_PRIOR_BROAD_WEIGHT) - 0.5 * dot(dsm_mask,
+    float log_core = log(1.0 - DSM_PRIOR_BROAD_WEIGHT) - 0.5 * dot(vec4(1.0),
         log(6.283185307179586 * core_variance) +
         core_residual * core_residual / core_variance
     );
-    float broad_variance = 9.0 + DSM_SIGMA_SQUARED;
-    float log_broad = log(DSM_PRIOR_BROAD_WEIGHT) - 0.5 * dot(dsm_mask,
+    float broad_variance = DSM_PRIOR_BROAD_VARIANCE + DSM_SIGMA_SQUARED;
+    float log_broad = log(DSM_PRIOR_BROAD_WEIGHT) - 0.5 * dot(vec4(1.0),
         vec4(log(6.283185307179586 * broad_variance)) +
         w * w / broad_variance
     );
     core = log_core >= log_broad;
-    float largest = max(log_core, log_broad);
-    return largest + log(exp(log_core - largest) + exp(log_broad - largest));
+    return dsm_log_add_exp(log_core, log_broad);
 }
 
 // Choose the new-shot state prior by the normal-component responsibility.
@@ -1753,7 +1756,7 @@ void dsm_set_prior() {
     dsm_prior_normal = dsm_prior_log_normal(dsm_z, core) +
                        log(1.0 - DSM_CONTAMINATION);
     dsm_new_prior_precision = core
-        ? DSM_PRIOR_PRECISION : vec4(1.0 / 9.0);
+        ? DSM_PRIOR_PRECISION : vec4(1.0 / DSM_PRIOR_BROAD_VARIANCE);
     dsm_new_prior_information = core
         ? DSM_PRIOR_INFORMATION : vec4(0.0);
 }
@@ -1763,10 +1766,7 @@ void dsm_candidate(uint index) {
         return;
     }
     if (index == dsm_old_count) {
-        float largest = max(dsm_prior_normal, dsm_log_outlier);
-        float q_prior = largest + log(
-            exp(dsm_prior_normal - largest) + exp(dsm_log_outlier - largest)
-        );
+        float q_prior = dsm_log_add_exp(dsm_prior_normal, dsm_log_outlier);
         dsm_logits[index] = dsm_log_hazard + q_prior;
         dsm_ages[index] = 0.0;
         return;
