@@ -267,6 +267,18 @@
 //!VAR float output_reverse_max_jhk
 //!STORAGE
 
+// Fingerprint of the static RGB/Jab tables and the chroma boundary.
+// The curve row is not part of this key. It is rebuilt every frame.
+//!BUFFER COLOR_LUT_CACHE
+//!VAR uint color_lut_valid
+//!VAR float color_lut_reference_white
+//!VAR float color_lut_contrast_ratio
+//!VAR float color_lut_hk_scaling
+//!VAR float color_lut_output_min_j
+//!VAR float color_lut_output_max_j
+//!VAR float color_lut_output_reverse_max_jhk
+//!STORAGE
+
 //!BUFFER PREVIEW_METRICS
 //!VAR uint preview_metrics_count
 //!VAR float preview_metrics_max_width
@@ -3236,6 +3248,35 @@ float evaluate_tone_curve(float x) {
         x2 = midgray + (y2 - midgray) / target_slope;
     }
 
+    // A collapsed toe or shoulder is a flat clip: every input past the anchor
+    // shares one code value. That is the path that erases shadow steps and
+    // specular peaks. Reserve a short output span so the existing rational
+    // segment can keep those steps ordered. Default weights leave y1 above
+    // black and y2 below white, and this block does not move them.
+    float output_span = max(y3 - y0, 1e-6);
+    if (y1 <= y0 && x1 > x0 && abs(target_slope) > 1e-6) {
+        float reserved = min(0.02 * output_span, 0.25 * output_span);
+        float lifted = min(y0 + reserved, y2);
+        float relocated = midgray + (lifted - midgray) / target_slope;
+        float toe_slope = (lifted - y0) / max(relocated - x0, 1e-6);
+        if (lifted > y0 && relocated > x0 && relocated < x2 &&
+            toe_slope < target_slope) {
+            x1 = relocated;
+            y1 = lifted;
+        }
+    }
+    if (y2 >= y3 && x3 > x2 && abs(target_slope) > 1e-6) {
+        float reserved = min(0.04 * output_span, 0.25 * output_span);
+        float lowered = max(y3 - reserved, y1);
+        float relocated = midgray + (lowered - midgray) / target_slope;
+        float shoulder_slope = (y3 - lowered) / max(x3 - relocated, 1e-6);
+        if (lowered < y3 && relocated > x1 && relocated < x3 &&
+            shoulder_slope < target_slope) {
+            x2 = relocated;
+            y2 = lowered;
+        }
+    }
+
     // Preserve the requested slope even when both junctions reach mid-gray.
     float slope = target_slope;
     float intercept = f_intercept(slope, x1, y1);
@@ -3417,19 +3458,39 @@ void generate_curve_lut(ivec2 atlas_position) {
     store_atlas(atlas_position, vec3(value, 0.0, 0.0));
 }
 
+bool color_lut_cache_hit() {
+    return color_lut_valid != 0u &&
+           color_lut_reference_white == reference_white &&
+           color_lut_contrast_ratio == contrast_ratio &&
+           color_lut_hk_scaling == hk_effect_compensate_scaling &&
+           color_lut_output_min_j == output_min_j &&
+           color_lut_output_max_j == output_max_j &&
+           color_lut_output_reverse_max_jhk == output_reverse_max_jhk;
+}
+
 void generate_lut_atlas_texel(ivec2 atlas_position) {
     if (atlas_position.x >= LUT_ATLAS_WIDTH ||
         atlas_position.y > CURVE_ROW) {
         return;
     }
 
-    if (atlas_position.y < LAB_TO_RGB_ROW) {
-        generate_RGB_to_LAB_lut(atlas_position);
-    } else if (atlas_position.y < CURVE_ROW) {
-        generate_LAB_to_RGB_lut(atlas_position);
-    } else if (atlas_position.x < CURVE_SIZE) {
-        generate_curve_lut(atlas_position);
+    // Color rows depend on the display settings stored in COLOR_LUT_CACHE.
+    // The 1024-point curve row follows exposure and the scene, so it stays
+    // in this dispatch and is stored on every frame. mpv evaluates //!WHEN
+    // from parameters only, so the skip is a GPU-side early return. The
+    // saved atlas keeps the color texels that this frame does not rewrite.
+    if (atlas_position.y < CURVE_ROW) {
+        if (color_lut_cache_hit())
+            return;
+        if (atlas_position.y < LAB_TO_RGB_ROW)
+            generate_RGB_to_LAB_lut(atlas_position);
+        else
+            generate_LAB_to_RGB_lut(atlas_position);
+        return;
     }
+
+    if (atlas_position.x < CURVE_SIZE)
+        generate_curve_lut(atlas_position);
 }
 
 void hook() {
@@ -3540,7 +3601,22 @@ float find_chroma_boundary(vec2 direction, int lightness_index) {
     return lower;
 }
 
+bool color_lut_cache_hit() {
+    return color_lut_valid != 0u &&
+           color_lut_reference_white == reference_white &&
+           color_lut_contrast_ratio == contrast_ratio &&
+           color_lut_hk_scaling == hk_effect_compensate_scaling &&
+           color_lut_output_min_j == output_min_j &&
+           color_lut_output_max_j == output_max_j &&
+           color_lut_output_reverse_max_jhk == output_reverse_max_jhk;
+}
+
 void hook() {
+    // Same key as the color atlas. A hit leaves the previous boundary in
+    // place. A miss runs after the atlas pass and sees the new inverse LUT.
+    if (color_lut_cache_hit())
+        return;
+
     ivec2 position = ivec2(gl_GlobalInvocationID.xy);
     if (position.x > BOUNDARY_HUE_INTERVALS ||
         position.y > BOUNDARY_LIGHTNESS_INTERVALS) {
@@ -3563,6 +3639,40 @@ void hook() {
     // Interpolation can still overestimate a curved boundary; the final pass
     // validates its actual RGB result and handles that case separately.
     imageStore(out_image, position, vec4(boundary * 0.999, 0.0, 0.0, 1.0));
+}
+
+//!HOOK OUTPUT
+//!SAVE EMPTY
+//!WIDTH 1
+//!HEIGHT 1
+//!COMPUTE 1 1
+//!DESC tone mapping (astra, lut cache commit)
+
+bool finite_cache_value(float value) {
+    return !isnan(value) && !isinf(value);
+}
+
+void hook() {
+    // Publish the key after the atlas and chroma passes have stored this
+    // frame's tables. Those passes still see the previous key, so a changed
+    // setting rebuilds in the same frame and the next frame hits the cache.
+    if (!finite_cache_value(reference_white) ||
+        !finite_cache_value(contrast_ratio) ||
+        !finite_cache_value(hk_effect_compensate_scaling) ||
+        !finite_cache_value(output_min_j) ||
+        !finite_cache_value(output_max_j) ||
+        !finite_cache_value(output_reverse_max_jhk)) {
+        color_lut_valid = 0u;
+        return;
+    }
+
+    color_lut_reference_white = reference_white;
+    color_lut_contrast_ratio = contrast_ratio;
+    color_lut_hk_scaling = hk_effect_compensate_scaling;
+    color_lut_output_min_j = output_min_j;
+    color_lut_output_max_j = output_max_j;
+    color_lut_output_reverse_max_jhk = output_reverse_max_jhk;
+    color_lut_valid = 1u;
 }
 
 //!HOOK OUTPUT

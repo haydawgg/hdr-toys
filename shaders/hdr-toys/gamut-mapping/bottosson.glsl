@@ -6,6 +6,10 @@
 // outside-only RGB soft compression reaches the real BT.709 cube while
 // accepting small hue shifts near its hard edges and corners.
 
+//!BUFFER GAMUT_BOUNDARY_CACHE
+//!VAR uint gamut_boundary_valid
+//!STORAGE
+
 //!HOOK OUTPUT
 //!SAVE GAMUT_BOUNDARY
 //!COMPONENTS 3
@@ -190,7 +194,25 @@ void generate_gamut_boundary(ivec2 position) {
 }
 
 void hook() {
+    // Primaries and the ColorChecker table are compile-time constants, so
+    // the boundary is the same for every frame. The flag is published by the
+    // following pass after this dispatch, and a saved image keeps the texels
+    // that this pass does not store again.
+    if (gamut_boundary_valid != 0u)
+        return;
+
     generate_gamut_boundary(ivec2(gl_GlobalInvocationID.xy));
+}
+
+//!HOOK OUTPUT
+//!SAVE EMPTY
+//!WIDTH 1
+//!HEIGHT 1
+//!COMPUTE 1 1
+//!DESC gamut mapping (bottosson, boundary cache commit)
+
+void hook() {
+    gamut_boundary_valid = 1u;
 }
 
 //!HOOK OUTPUT
@@ -230,6 +252,15 @@ const mat3 XYZ_TO_BT709 = mat3(
      3.2409699419045226, -1.5373831775700940, -0.4986107602930034,
     -0.9692436362808796,  1.8759675015077202,  0.0415550574071756,
      0.0556300796969937, -0.2039769588889765,  1.0569715142428786
+);
+
+// XYZ_TO_BT709 applied after BT2020_TO_XYZ, in the same order as
+// `rgb * BT2020_TO_XYZ * XYZ_TO_BT709`. Protected colors stay colorimetric,
+// so they use this matrix instead of an Oklab round trip.
+const mat3 BT2020_TO_BT709 = mat3(
+     1.6604910021084354, -0.5876411387885495, -0.0728498633198849,
+    -0.1245504745215907,  1.1328998971259596, -0.0083494226043694,
+    -0.0181507633549052, -0.1005788980080074,  1.1187296613629130
 );
 
 const mat3 XYZ_TO_LMS = mat3(
@@ -274,12 +305,6 @@ vec3 oklab_to_xyz(vec3 lab) {
     vec3 lms_root = lab * OKLAB_TO_LMS;
     vec3 lms = lms_root * lms_root * lms_root;
     return lms * LMS_TO_XYZ;
-}
-
-vec3 oklab_to_oklch(vec3 lab) {
-    float chroma = length(lab.yz);
-    float hue = chroma > CHROMA_EPSILON ? atan(lab.z, lab.y) : 0.0;
-    return vec3(lab.x, chroma, hue);
 }
 
 float normalized_hue(float hue) {
@@ -390,34 +415,6 @@ vec3 reduce_to_guide_gamut(vec3 lab, float weight) {
     return mix(lab, target, weight);
 }
 
-vec3 map_to_guide_gamut(vec3 lab) {
-    vec3 lch = oklab_to_oklch(lab);
-    float lightness = clamp(lch.x, 0.0, 1.0);
-    vec3 boundary = sample_gamut_boundary(lightness, lch.z);
-    float protection_boundary = smooth_minimum(
-        boundary.z,
-        PROTECTION_CAP * boundary.y,
-        PROTECTION_CAP_BLEND
-    );
-
-    if (lch.y <= protection_boundary)
-        return lab;
-
-    float input_span = max(
-        boundary.x - protection_boundary,
-        SHELL_MIN_CHROMA_SPAN
-    );
-    float input_position = clamp(
-        (lch.y - protection_boundary) / input_span,
-        0.0,
-        1.0
-    );
-    return reduce_to_guide_gamut(
-        lab,
-        smooth_shell_weight(input_position)
-    );
-}
-
 vec3 soft_saturate(vec3 value, float softness) {
     float a = 1.0 + softness;
     value = min(value, vec3(a));
@@ -458,11 +455,50 @@ vec3 soft_clip_rgb_outside_only(vec3 color) {
     return SOFT_CLIP_GREY + scale * direction * mapped;
 }
 
+vec3 colorimetric_bt709(vec3 bt2020) {
+    return clamp(bt2020 * BT2020_TO_BT709, 0.0, 1.0);
+}
+
 vec4 hook() {
     vec4 color = HOOKED_tex(HOOKED_pos);
     vec3 xyz = color.rgb * BT2020_TO_XYZ;
     vec3 lab = xyz_to_oklab(xyz);
-    lab = map_to_guide_gamut(lab);
+    float chroma = length(lab.yz);
+
+    // Neutrals are inside the protection envelope at every lightness, so
+    // they do not need the boundary texture.
+    if (chroma <= CHROMA_EPSILON) {
+        color.rgb = colorimetric_bt709(color.rgb);
+        return color;
+    }
+
+    float hue = atan(lab.z, lab.y);
+    float lightness = clamp(lab.x, 0.0, 1.0);
+    vec3 boundary = sample_gamut_boundary(lightness, hue);
+    float protection_boundary = smooth_minimum(
+        boundary.z,
+        PROTECTION_CAP * boundary.y,
+        PROTECTION_CAP_BLEND
+    );
+
+    // Inside the protected shell the source color is already the intended
+    // BT.709 color. The matrix avoids the cube-root round trip, which
+    // shifts hue by a fraction of a code value.
+    if (chroma <= protection_boundary) {
+        color.rgb = colorimetric_bt709(color.rgb);
+        return color;
+    }
+
+    float input_span = max(
+        boundary.x - protection_boundary,
+        SHELL_MIN_CHROMA_SPAN
+    );
+    float input_position = clamp(
+        (chroma - protection_boundary) / input_span,
+        0.0,
+        1.0
+    );
+    lab = reduce_to_guide_gamut(lab, smooth_shell_weight(input_position));
     vec3 mapped_xyz = oklab_to_xyz(lab);
     vec3 mapped_rgb = mapped_xyz * XYZ_TO_BT709;
     color.rgb = soft_clip_rgb_outside_only(mapped_rgb);
